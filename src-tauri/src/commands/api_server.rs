@@ -14,6 +14,26 @@ use crate::api_server::pool::ApiPool;
 use crate::api_server::server::{start_api_server, ApiServerHandle};
 use crate::api_server::{ApiLogger, ApiSharedState};
 
+/// WorkBuddy 产品线每账号积分保留底线（需求：不把账号打到 0）。
+const WB_RESERVE_CREDITS: f64 = 50.0;
+
+/// 计算 WB 池实际生效的保留线。
+///
+/// 语义：`max(全局配置, 50)`——
+/// - 全局未配置（0）时 WB 池取 50，落实「每账号保留 50 积分」需求；
+/// - 用户显式配置更高值（如 200）时尊重更高值；
+/// - 用户把全局设为更低值（如 10）时 WB 池仍保 50，不擅自取消该底线。
+///
+/// 作用域：仅 `wb_pool`。Trae / Qoder / BuddyAI 三池一律使用全局值，保证
+/// 「其他产品线调度规则不受影响」。
+pub(crate) fn wb_reserve_credits(global: f64) -> f64 {
+    if !global.is_finite() || global < WB_RESERVE_CREDITS {
+        WB_RESERVE_CREDITS
+    } else {
+        global
+    }
+}
+
 /// 运行时状态：服务器句柄 + 共享状态
 pub struct ApiServerRuntime {
     pub handle: ApiServerHandle,
@@ -218,7 +238,10 @@ async fn do_start_inner(
     // 国际档不过滤低余额账号，与 dispatch_policy_set 热应用「四池即时生效」不一致）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
-    wb_pool.set_reserve_credits(reserve_credits);
+    // WorkBuddy 产品线保留线（2026-11 需求）：每账号至少保留 50 积分，不把账号打到 0。
+    // 产品线隔离：Trae / Qoder / BuddyAI 三池严格沿用全局 dispatch_policy.reserve_credits，
+    // 本规则只作用于 WB 池；用户显式配置高于 50 时取更高值（不擅自取消 50 底线）。
+    wb_pool.set_reserve_credits(wb_reserve_credits(reserve_credits));
     qoder_pool.set_reserve_credits(reserve_credits);
     buddy_ai_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
@@ -2119,7 +2142,10 @@ pub fn dispatch_policy_set(
     //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared.pool.set_reserve_credits(policy.reserve_credits);
-        rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
+        // WB 池保留线含 50 底线（见 wb_reserve_credits）；其余三池沿用全局值
+        rt.shared
+            .wb_pool
+            .set_reserve_credits(wb_reserve_credits(policy.reserve_credits));
         rt.shared
             .qoder_pool
             .set_reserve_credits(policy.reserve_credits);

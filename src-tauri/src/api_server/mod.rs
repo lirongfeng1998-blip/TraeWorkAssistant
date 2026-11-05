@@ -20,6 +20,7 @@ pub mod server;
 pub mod sse;
 pub mod unified_catalog;
 pub mod usage;
+pub mod wb_auto;
 pub mod wb_catalog;
 pub mod wb_images;
 pub mod wb_model_route;

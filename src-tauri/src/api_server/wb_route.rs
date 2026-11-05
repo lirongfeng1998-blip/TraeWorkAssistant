@@ -806,6 +806,43 @@ fn log_longctx_hint(state: &WbView, peek: &Value, model: &str) {
     }
 }
 
+// ==================== 账号归因旁路（workbuddy-auto 用） ====================
+
+/// 一次 WB 执行的「账号归因」旁路记录器。
+///
+/// 为什么需要它：`wb_aggregate_chat` / `wb_stream_chat` 的返回类型必须是
+/// `Response`（流式与标头语义不可改），无法从中返回「本次用了哪个账号」。
+/// 因此以**可选出参**方式旁路回传，签名其余部分零改动：
+/// - `None`：既有调用方（普通模型请求）行为、性能完全不变；
+/// - `Some(trace)`：workbuddy-auto 传入，取回实际选中的账号 UID。
+///
+/// 语义边界（诚实标注）：
+/// - 记录的是「最后一个绑定成功的候选账号」。一次调用内部若换过号（上游失败重试），
+///   这里得到的是最终那一次尝试的账号——与失败归因需要的账号一致。
+/// - 流式路径的取号发生在后台线程内，取回时机不确定（best-effort）；
+///   非流式路径在调用返回时即已就绪。
+/// - 只记录 UID，不携带任何凭据/Token。
+#[derive(Clone, Debug, Default)]
+pub struct WbExecTrace(Arc<std::sync::Mutex<Option<String>>>);
+
+impl WbExecTrace {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    /// 绑定成功时记录账号 UID（内部覆盖写，最后一个胜出）
+    pub fn note_pick(&self, uid: &str) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = Some(uid.to_string());
+        }
+    }
+
+    /// 读取已记录的 UID（尚未取号时返回 None）
+    pub fn uid(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|g| g.clone())
+    }
+}
+
 // ==================== 流式入口 ====================
 
 pub fn wb_stream_chat(
@@ -818,6 +855,7 @@ pub fn wb_stream_chat(
     key_id: String,
     guard: InflightGuard,
     ns_encoded: std::collections::HashSet<String>,
+    trace: Option<WbExecTrace>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -864,7 +902,7 @@ pub fn wb_stream_chat(
 
         // wb 族池视图（§3.2）：Buddy（CN）/ BuddyAI（Intl）共用执行内核
         let view = WbView::new(state, buddy_ai);
-        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &ns_encoded);
+        run_wb_stream(&view, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &ns_encoded, trace.as_ref());
     });
 
     let stream = ReceiverStream::new(rx);
@@ -893,6 +931,8 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
     ns_encoded: &std::collections::HashSet<String>,
+    // workbuddy-auto 账号归因旁路（None = 普通请求，零开销）
+    trace: Option<&WbExecTrace>,
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -1073,6 +1113,10 @@ fn run_wb_stream(
         }
         attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
         *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+        // workbuddy-auto 账号归因旁路：绑定成功即记录（普通请求 trace=None，零开销）
+        if let Some(t) = trace {
+            t.note_pick(&picked.uid);
+        }
         // 审查修复（L1）：绑定成功才更新「最近绑定账号」（CAS 拒绝的候选不算）
         last_bound_uid = Some(picked.uid.clone());
 
@@ -1535,6 +1579,7 @@ pub async fn wb_aggregate_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    trace: Option<WbExecTrace>,
 ) -> Response {
     let model_out = model.clone();
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
@@ -1684,6 +1729,10 @@ pub async fn wb_aggregate_chat(
             }
             attempts += 1; // 绑定成功即真实消耗一个候选（CAS 拒绝不计入分母）
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            // workbuddy-auto 账号归因旁路：绑定成功即记录（普通请求 trace=None，零开销）
+            if let Some(t) = trace.as_ref() {
+                t.note_pick(&picked.uid);
+            }
 
             let is_sticky_hit =
                 sticky_uid.as_deref() == Some(picked.uid.as_str()) && !sticky_conv.is_empty();

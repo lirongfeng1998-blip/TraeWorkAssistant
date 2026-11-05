@@ -1224,6 +1224,26 @@ impl ApiPool {
         (total, in_allowed)
     }
 
+    /// 当前可调度账号 UID 集合（workbuddy-auto 的账号维度额度判定用）。
+    ///
+    /// `skip_credit_filters = true` 时不受「保留积分」过滤影响——**免费额度耗尽**与
+    /// **积分是否达标**是两件不同的事：账号维度判定必须看到全部健康账号，否则
+    /// 「账号因触及保留线被过滤」会让模型被误判为「所有账号都已耗尽」而全局跳过。
+    /// 新增账号天然出现在此集合中（池来源是数据库快照，非启动时固定清单）。
+    pub fn selectable_uids(&self, skip_credit_filters: bool) -> Vec<String> {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        let reserve = self.reserve_credits();
+        let mut out: Vec<String> = entries
+            .values()
+            .filter(|e| selectable(e, &tried, now, reserve, skip_credit_filters))
+            .map(|e| e.uid.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// hard_credit（积分耗尽）账号统计（issue #156）：返回 (处于次日 04:00 硬冷却
     /// 的账号数, 最早恢复时刻 Unix 秒)。供 exhaust_message / no_healthy_detail
     /// 携带「积分耗尽·次日 04:00 恢复」语义，使客户端可见冷却原因与恢复时间

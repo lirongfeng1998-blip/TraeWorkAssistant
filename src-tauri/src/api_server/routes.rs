@@ -1163,6 +1163,12 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }
         }
     }
+    // workbuddy-auto 虚拟模型（本机调度层，非上游真实模型）：仅 WB 上游启用时
+    // 对外暴露，避免 WB 关闭时显示一个必然 400 的入口。置于列表尾部，不影响
+    // 既有条目的顺序与索引语义。
+    if wb_enabled {
+        data.push(super::wb_auto::model_record());
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -1221,6 +1227,20 @@ pub async fn chat_completions(
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
 
+    // workbuddy-auto（虚拟模型）在「API Key 鉴权 → 白名单」之后才接管，
+    // **不绕过任何准入层**；内部按免费优先/倍率升序逐候选调度，每次候选尝试都走
+    // 既有 wb_aggregate_chat / wb_stream_chat（计费/日志/并发/超时/流式一份实现）。
+    if super::wb_auto::is_auto(&model) {
+        return super::wb_auto::handle(
+            state,
+            peek,
+            Protocol::OpenAi,
+            key_str,
+            std::collections::HashSet::new(),
+        )
+        .await;
+    }
+
     // 统一调度分流点（§4.1 ③~⑥）：resolve_target 决定资源池/会话池粘性/跨池回退/
     // 错误矩阵，替代原 resolve_wb_target 单向判定；默认策略下行为与改造前一致（§9.1）。
     // inflight guard 随执行路径持有至请求结束（流式含整个后台任务）
@@ -1244,9 +1264,9 @@ pub async fn chat_completions(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, std::collections::HashSet::new(), None);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, None).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -1348,6 +1368,20 @@ pub async fn responses_api(
     let state_clone = state.clone();
     let start_ts = std::time::Instant::now();
     let key_str = key_id.map(|Extension(k)| k.0).unwrap_or_else(|| "anonymous".to_string());
+
+    // workbuddy-auto（虚拟模型）：同样在鉴权 + 白名单 + Responses→Chat 投影之后接管，
+    // 不绕过准入层。放在 guard 创建之前，避免为接管路径多进出一次 inflight 计数。
+    if super::wb_auto::is_auto(&model) {
+        return super::wb_auto::handle(
+            state,
+            chat_body,
+            Protocol::Responses,
+            key_str,
+            ns_encoded,
+        )
+        .await;
+    }
+
     // inflight guard：随执行路径持有至请求结束（§4.5）
     let guard = state.inflight_guard();
 
@@ -1441,9 +1475,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, ns_encoded)
+        wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, ns_encoded, None)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, ns_encoded, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
+        wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, ns_encoded, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, None).await
     }
 }
 
@@ -1641,9 +1675,9 @@ pub async fn messages(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, std::collections::HashSet::new(), None);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, None).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1796,9 +1830,9 @@ pub async fn completions(
                 let body_vec = apply_effort_hint(body_vec, hint);
                 let buddy_ai = r.pool == TargetPool::BuddyAi;
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new());
+                    return wb_route::wb_stream_chat(state_clone, buddy_ai, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, std::collections::HashSet::new(), None);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, buddy_ai, body_vec, std::collections::HashSet::new(), r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, None).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
