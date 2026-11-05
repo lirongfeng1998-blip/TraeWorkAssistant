@@ -719,7 +719,12 @@ fn tag(
     Response::from_parts(parts, body)
 }
 
-/// /v1/models 注入条目（虚拟模型，非上游真实模型）
+/// /v1/models 注入条目（虚拟模型，非上游真实模型）。
+///
+/// 刻意**只声明可确证的字段**：不写 `rate`（自动模型可能落到付费模型，写 0 会被
+/// 前端当作「免费」展示，属于伪造）、不写 `context_length` / `max_tokens` /
+/// `supports_image` / `supported_efforts`（随实际选中模型而变，写死即是假信息）。
+/// 实际执行信息由响应头 `x-wb-auto-model` / `-rate` / `-free` 给出。
 pub fn model_record() -> Value {
     serde_json::json!({
         "id": AUTO_MODEL_ID,
@@ -727,12 +732,7 @@ pub fn model_record() -> Value {
         "created": 0,
         "owned_by": "aiwork-auto",
         "display": "WorkBuddy Auto",
-        "description": "WorkBuddy 智能调度：免费模型优先 → 倍率递增 → 账号池自动接管",
-        "context_length": 200000,
-        "max_tokens": 64000,
-        "supports_image": false,
-        "supported_efforts": [],
-        "rate": 0.0
+        "description": "WorkBuddy 智能调度：免费模型优先 → 倍率递增 → 账号池自动接管（实际模型见响应头 x-wb-auto-model）"
     })
 }
 
@@ -953,6 +953,19 @@ mod integration_tests {
         uids.iter().map(|s| s.to_string()).collect()
     }
 
+    fn m(id: &str, rate: f64) -> wb_catalog::WbModel {
+        wb_catalog::WbModel {
+            id: id.to_string(),
+            display: id.to_string(),
+            context_length: 0,
+            max_tokens: 0,
+            supports_image: false,
+            supported_efforts: vec![],
+            effort_override: None,
+            rate,
+        }
+    }
+
     /// A/B/C 运行中 → 依次触及 50 积分保留线 → 新增 D 自动入池并接管。
     /// 全程**没有重启**，也没有手动改白名单：D 只是出现在一次新的池快照里。
     #[test]
@@ -1045,6 +1058,62 @@ mod integration_tests {
             now,
             &["A".to_string(), "B".to_string(), "D".to_string()]
         ));
+    }
+
+    /// 低倍率耗尽 → 切换到更高倍率（同一升序链，不设任何虚拟阈值）
+    #[test]
+    fn low_multiplier_exhausted_falls_to_higher() {
+        let models = vec![m("paid-low", 0.1), m("paid-mid", 0.6), m("paid-high", 2.0)];
+        let mut f = QuotaFile::default();
+        let now = 1_760_000_000;
+        let uids = vec!["A".to_string()];
+
+        let ids = |f: &QuotaFile| -> Vec<String> {
+            plan_candidates(&models, &|id| model_blocked(f, id, now, &uids))
+                .into_iter()
+                .map(|c| c.model)
+                .collect()
+        };
+        assert_eq!(ids(&f), vec!["paid-low", "paid-mid", "paid-high"]);
+
+        // paid-low 耗尽 → 落到 paid-mid（次低）
+        mark(&mut f, "A", "paid-low", QuotaStatus::CreditExhausted, "t", "x", now, None);
+        assert_eq!(ids(&f), vec!["paid-mid", "paid-high"]);
+
+        // paid-mid 也耗尽 → 落到最高倍率兜底
+        mark(&mut f, "A", "paid-mid", QuotaStatus::CreditExhausted, "t", "x", now, None);
+        assert_eq!(ids(&f), vec!["paid-high"]);
+    }
+
+    /// 状态持久化编解码：写入 kv 的形式（serde JSON）能原样还原，
+    /// 即「重启后额度状态不丢」的前提条件（真正的重启验证需实机，见报告）。
+    #[test]
+    fn quota_state_roundtrips_through_serialization() {
+        let mut f = QuotaFile::default();
+        let now = 1_760_000_000;
+        mark(
+            &mut f,
+            "uid-a",
+            "free-a",
+            QuotaStatus::FreeExhausted,
+            "免费额度耗尽",
+            "free quota exhausted",
+            now,
+            Some(now + 3600),
+        );
+        f.version = 1;
+        let json = serde_json::to_string(&f).expect("序列化");
+        let back: QuotaFile = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.version, 1);
+        assert_eq!(back.entries.len(), 1);
+        // 还原后判定语义必须一致：未到重置时刻仍为阻挡，过点自动恢复
+        assert!(account_model_blocked(&back, "uid-a", "free-a", now));
+        assert!(!account_model_blocked(&back, "uid-a", "free-a", now + 3601));
+        // 周期分桶与状态都要原样带回
+        let e = back.entries.values().next().unwrap();
+        assert_eq!(e.status, QuotaStatus::FreeExhausted);
+        assert_eq!(e.period, period_of(now));
+        assert_eq!(e.reset_at, Some(now + 3600));
     }
 
     /// 保留线口径：WB 池取 max(全局, 50)；其余池不受影响（全局值原样）
