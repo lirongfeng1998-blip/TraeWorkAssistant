@@ -250,6 +250,9 @@ fn tick(app: &AppHandle, st: &AppState) {
     // 网关运行态句柄（main.rs manage；积分类任务运行中回写池快照用，issue #67）
     let api_runtime = app
         .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    // 60 秒一致性巡检（兜底）：网关运行时比对 WorkBuddy 账号集合签名，漂移即热重载
+    //（事件驱动路径已覆盖 OAuth/成员变更；此处只兜底漏事件，不因余额波动重建）
+    crate::commands::api_server::pool_consistency_patrol(st, &api_runtime);
     let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）

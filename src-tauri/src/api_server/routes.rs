@@ -1133,6 +1133,11 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             }
         }
     }
+    // workbuddy-auto 虚拟模型：WB 模型级智能调度入口（不出现在上游目录中，
+    // 由本网关自造；仅对 WB 请求生效，不影响其他池/模型）
+    if wb_enabled {
+        data.push(super::wb_auto::model_record());
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -1183,6 +1188,34 @@ pub async fn chat_completions(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(&state.default_model)
         .to_string();
+    // workbuddy-auto：WB 模型级智能调度（免费优先 → 倍率递增 → 高倍率兜底）
+    // 必须在白名单与 resolve_target 之前截获：虚拟模型不在任何上游目录中
+    if model == super::wb_auto::AUTO_MODEL_ID {
+        let key_str = key_id
+            .map(|Extension(k)| k.0)
+            .unwrap_or_else(|| "anonymous".to_string());
+        let start_ts = std::time::Instant::now();
+        return if stream {
+            super::wb_auto::stream_auto(
+                state,
+                peek,
+                Protocol::OpenAi,
+                key_str,
+                std::collections::HashSet::new(),
+                start_ts,
+            )
+        } else {
+            super::wb_auto::aggregate_auto(
+                state,
+                peek,
+                Protocol::OpenAi,
+                key_str,
+                std::collections::HashSet::new(),
+                start_ts,
+            )
+            .await
+        };
+    }
     // issue #26 白名单准入（空名单不限）
     if let Some(resp) = whitelist_check(&state, &model, Protocol::OpenAi) {
         return resp;
@@ -1300,6 +1333,41 @@ pub async fn responses_api(
         .unwrap_or(&state.default_model)
         .to_string();
     // issue #26 白名单准入（空名单不限）
+    // workbuddy-auto：WB 模型级智能调度（免费优先 → 倍率递增），必须在白名单与
+    // WB 目录解析之前截获——虚拟模型不在上游目录中，交由 resolve_wb_target 会被 400
+    if model == super::wb_auto::AUTO_MODEL_ID {
+        let key_str = key_id
+            .map(|Extension(k)| k.0)
+            .unwrap_or_else(|| "anonymous".to_string());
+        let chat_body: Value = match super::wb_responses::responses_to_chat(&peek) {
+            Ok(v) => v,
+            Err(e) => {
+                return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e);
+            }
+        };
+        let encoded_tools = super::wb_responses::encoded_tool_names(&peek);
+        let start_ts = std::time::Instant::now();
+        return if stream {
+            super::wb_auto::stream_auto(
+                state,
+                chat_body,
+                Protocol::Responses,
+                key_str,
+                encoded_tools,
+                start_ts,
+            )
+        } else {
+            super::wb_auto::aggregate_auto(
+                state,
+                chat_body,
+                Protocol::Responses,
+                key_str,
+                encoded_tools,
+                start_ts,
+            )
+            .await
+        };
+    }
     if let Some(resp) = whitelist_check(&state, &model, Protocol::Responses) {
         return resp;
     }

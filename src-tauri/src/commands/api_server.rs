@@ -199,8 +199,11 @@ pub async fn do_start(
     // M3 审查修复：buddy-ai 池补齐——原先冷启动漏设，调度策略保存前启动的服务
     // 国际档不过滤低余额账号，与 dispatch_policy_set 热应用「四池即时生效」不一致）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
+    // WorkBuddy 保留线（既定规则：每账号保留 50 积分，不得把账号打到 0）：
+    // 全局策略未配置（0）时 WB 池按 50 执行；其余池严格沿用全局值，保持产品线隔离
+    let wb_reserve = if reserve_credits > 0.0 { reserve_credits } else { 50.0 };
     pool.set_reserve_credits(reserve_credits);
-    wb_pool.set_reserve_credits(reserve_credits);
+    wb_pool.set_reserve_credits(wb_reserve);
     qoder_pool.set_reserve_credits(reserve_credits);
     buddy_ai_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
@@ -970,6 +973,67 @@ fn apply_pool_snapshot(
 /// 全量重建修复运行中池的陈旧快照——旧 JWT / SessionDead 禁用 / 冷却 / 积分 /
 /// 新勾选成员缺失（此前仅 note_refresh_success 单点回填 JWT，覆盖不了这些场景，
 /// 用户实测「刚登录的 JWT 网关还是不行」即此根因）。
+/// 60 秒一致性巡检（兜底）：WorkBuddy 账号集合漂移检测。
+///
+/// 事件驱动热重载（`reload_pools_if_running`）已覆盖 OAuth 新增/重授权、成员与
+/// 分组变更、导入导出等路径；本函数只兜底「事件丢失 / 外部直接写库 / 异常退出后
+/// 状态不一致」的场景。判定依据是账号集合签名（uid + 启用位），**刻意不比较
+/// 积分余额等易变字段**——余额正常波动不应触发整池重建（会把粘性与在途状态打散）。
+pub fn pool_consistency_patrol(state: &AppState, runtime: &Mutex<Option<ApiServerRuntime>>) {
+    {
+        let g = safe_lock(runtime);
+        if g.is_none() {
+            return; // 网关未运行：无需巡检
+        }
+    }
+    let db = crate::store::db(&state.data_dir);
+    let pool_json = crate::store::docs::wb_pool_load(&db);
+    let mut parts: Vec<String> = pool_json
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let uid = a
+                        .get("user_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if uid.is_empty() {
+                        return None;
+                    }
+                    let disabled = a
+                        .get("disabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    Some(format!("{uid}:{}", u8::from(disabled)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.sort();
+    let sig = parts.join(",");
+
+    static LAST_SIG: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+    let last = LAST_SIG.get_or_init(|| Mutex::new(None));
+    let mut lg = safe_lock(last);
+    match lg.as_deref() {
+        None => {
+            *lg = Some(sig); // 首次只建立基线，不触发重建
+            return;
+        }
+        Some(prev) if prev == sig => return, // 无漂移
+        _ => {}
+    }
+    *lg = Some(sig);
+    drop(lg);
+    reload_pools_if_running(state, runtime);
+    fs_utils::app_log(
+        &state.data_dir,
+        "API服务池一致性巡检：检测到 WorkBuddy 账号集合漂移，已触发全量热重载",
+    );
+}
+
 pub fn reload_pools_if_running(
     state: &AppState,
     runtime: &Mutex<Option<ApiServerRuntime>>,
@@ -1977,7 +2041,13 @@ pub fn dispatch_policy_set(
     //（配置锁外，与 pool_set 热应用同模式；负值由 set_reserve_credits 防御归零）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
         rt.shared.pool.set_reserve_credits(policy.reserve_credits);
-        rt.shared.wb_pool.set_reserve_credits(policy.reserve_credits);
+        // WB 保留线与冷启动同口径：未配置时 50（每账号保留 50 积分）
+        let wb_reserve = if policy.reserve_credits > 0.0 {
+            policy.reserve_credits
+        } else {
+            50.0
+        };
+        rt.shared.wb_pool.set_reserve_credits(wb_reserve);
         rt.shared
             .qoder_pool
             .set_reserve_credits(policy.reserve_credits);
