@@ -921,17 +921,26 @@ fn run_wb_stream(
 
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
     // 子 Key 限定上游不含粘性账号时忽略粘性
-    let sticky0: Option<(String, String)> = state
-        .sticky_resolve(&sticky_key, now_ts())
-        .and_then(|b| {
-            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
-                return None;
-            }
-            state
-                .route_pool()
-                .pick_by_uid(&b.uid, false)
-                .map(|_| (b.uid, b.conv_id))
-        });
+    // 绑定存在但账号不可选（零积分/冷却/禁用/被 Key 白名单排除）→ 首轮 None，
+    // 并立刻解除该会话的无效绑定（见下方 sticky_unbind_stale 说明）
+    let sticky_bound = state.sticky_resolve(&sticky_key, now_ts());
+    let sticky0: Option<(String, String)> = sticky_bound.as_ref().and_then(|b| {
+        if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+            return None;
+        }
+        state
+            .route_pool()
+            .pick_by_uid(&b.uid, false)
+            .map(|_| (b.uid.clone(), b.conv_id.clone()))
+    });
+    // 无效粘性绑定必须当场解除：`resolve` 每次命中都会刷新 last_seen，`bind` 的
+    // 5s 防并发分支因此永久拒绝改绑 → 会话会一直粘在不可用账号上（每个请求先
+    // 空跑一次粘性判定，且换号后上游会话一致性也拿不到）。解除后下一次成功
+    // 请求即绑定到真正在用的账号。
+    if sticky0.is_none() && sticky_bound.is_some() {
+        state.route_sticky().remove(&sticky_key);
+        state.route_sticky().save(&state.data_dir);
+    }
     let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
     let sticky_conv: String = sticky0
         .as_ref()
@@ -1559,17 +1568,21 @@ pub async fn wb_aggregate_chat(
             .and_then(|k| k.pool_constraints(state.pool_label()))
             .map_or((None, None), |c| (c.allowed, c.dedicated));
 
-        let sticky0: Option<(String, String)> = state
-            .sticky_resolve(&sticky_key, now_ts())
-            .and_then(|b| {
-                if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
-                    return None;
-                }
-                state
-                    .route_pool()
-                    .pick_by_uid(&b.uid, false)
-                    .map(|_| (b.uid, b.conv_id))
-            });
+        // 同上（非流式路径）：无效粘性绑定当场解除，避免永久粘在不可用账号
+        let sticky_bound = state.sticky_resolve(&sticky_key, now_ts());
+        let sticky0: Option<(String, String)> = sticky_bound.as_ref().and_then(|b| {
+            if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
+                return None;
+            }
+            state
+                .route_pool()
+                .pick_by_uid(&b.uid, false)
+                .map(|_| (b.uid.clone(), b.conv_id.clone()))
+        });
+        if sticky0.is_none() && sticky_bound.is_some() {
+            state.route_sticky().remove(&sticky_key);
+            state.route_sticky().save(&state.data_dir);
+        }
         let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
         let sticky_conv: String = sticky0
             .as_ref()

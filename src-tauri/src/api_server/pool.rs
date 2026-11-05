@@ -3072,4 +3072,154 @@ mod tests {
         let pool2 = build_pool(&[("a", 1000.0, 0), ("b", 1000.0, 0)]);
         assert_ne!(pool2.config_fingerprint(), fp0);
     }
+
+    // ============ 同会话自动切号（模拟账号，不消耗真实积分） ============
+
+    fn sticky_key(cid: &str) -> crate::api_server::wb_sticky::SessionKey {
+        crate::api_server::wb_sticky::SessionKey::from_body(&serde_json::json!({
+            "conversation_id": cid,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+    }
+
+    /// 路由侧粘性首轮语义复刻：resolve → 白名单 → pick_by_uid（含积分/冷却过滤）；
+    /// 命中失败时当场解除无效绑定（与 wb_route.rs 的修复一致）
+    fn sticky_first_pick(
+        pool: &ApiPool,
+        store: &crate::api_server::wb_sticky::StickyStore,
+        key: &crate::api_server::wb_sticky::SessionKey,
+    ) -> Option<String> {
+        let bound = store.resolve(key, now_ts());
+        let picked = bound
+            .as_ref()
+            .and_then(|b| pool.pick_by_uid(&b.uid, false).map(|_| b.uid.clone()));
+        if picked.is_none() && bound.is_some() {
+            store.remove(key);
+        }
+        picked
+    }
+
+    #[test]
+    fn same_session_fails_over_when_bound_account_exhausted() {
+        let pool = build_pool(&[
+            ("A", 100.0, 0),
+            ("B", 100.0, 0),
+            ("C", 100.0, 0),
+        ]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        let store = crate::api_server::wb_sticky::StickyStore::new();
+        let key = sticky_key("conv-fixed-001");
+
+        // 2) 首次：绑定 A 并命中
+        store.bind(&key, "A", "up-conv-1", now_ts());
+        assert_eq!(sticky_first_pick(&pool, &store, &key).as_deref(), Some("A"));
+
+        // 3) A 积分耗尽（快照更新，不触碰真实账号）
+        let mut snap = HashMap::new();
+        snap.insert("A".to_string(), (0.0, None));
+        pool.update_credits_snapshot(&snap);
+
+        // 4) 同一会话下一次请求不得继续使用 A
+        assert!(
+            sticky_first_pick(&pool, &store, &key).is_none(),
+            "A 已零积分，粘性首轮必须判定不可用"
+        );
+
+        // 5/6) 自动切到其他账号（B 或 C），并被路由回写重绑（无效绑定已解除 → 改绑生效）
+        let next = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .expect("应有其他健康候选");
+        assert_ne!(next.uid, "A", "换号不得再回到零积分的 A");
+        let second = next.uid.clone();
+        store.bind(&key, &second, "up-conv-2", now_ts());
+        assert_eq!(
+            store.resolve(&key, now_ts()).map(|b| b.uid),
+            Some(second.clone()),
+            "成功换号后粘性绑定必须改指新账号"
+        );
+
+        // 7) 第二个账号也不可用（鉴权失败禁用）→ 继续切到剩余账号
+        pool.note_error(&second, ErrKind::SessionDead);
+        assert!(
+            sticky_first_pick(&pool, &store, &key).is_none(),
+            "{second} 已禁用，粘性首轮必须判定不可用"
+        );
+        let third = pool
+            .pick_excluding_constrained(&HashSet::new(), None, None)
+            .expect("剩余账号仍应可用");
+        let third_uid = third.uid.clone();
+        assert_ne!(third_uid, "A");
+        assert_ne!(third_uid, second, "已禁用账号不得再被选中");
+
+        // 8) 单账号失败不得整体隔离：剩余账号连续可用，冷却仅作用于自身
+        for _ in 0..20 {
+            assert_eq!(
+                pool.pick_excluding_constrained(&HashSet::new(), None, None)
+                    .unwrap()
+                    .uid,
+                third_uid
+            );
+        }
+        assert!(pool.pick_by_uid("A", false).is_none(), "A 零积分仍应被过滤");
+        assert!(
+            pool.pick_by_uid(&second, false).is_none(),
+            "第二个账号仍应处于禁用冷却"
+        );
+    }
+
+    #[test]
+    fn sticky_binding_is_dropped_on_auth_failure() {
+        let store = crate::api_server::wb_sticky::StickyStore::new();
+        let key = sticky_key("conv-fixed-002");
+        store.bind(&key, "A", "up-conv-1", now_ts());
+        assert!(store.resolve(&key, now_ts()).is_some());
+        // 路由侧 401/鉴权失败分支：kind.unbinds_sticky() → unbind_uid
+        store.unbind_uid("A");
+        assert!(
+            store.resolve(&key, now_ts()).is_none(),
+            "鉴权失败必须解除该账号的全部粘性绑定"
+        );
+    }
+
+    #[test]
+    fn sticky_cooldown_is_per_account_not_pool_wide() {
+        let pool = build_pool(&[("A", 100.0, 0), ("B", 100.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+        pool.note_error("A", ErrKind::SoftRate);
+        // A 冷却、B 不受影响：池仍可正常取号
+        for _ in 0..30 {
+            assert_eq!(
+                pool.pick_excluding_constrained(&HashSet::new(), None, None)
+                    .unwrap()
+                    .uid,
+                "B",
+                "单账号冷却不得波及池内其他账号"
+            );
+        }
+        assert_eq!(pool.selectable_stats_in(None, false), (1, 1));
+    }
+
+    #[test]
+    fn stale_sticky_must_be_cleared_before_rebind() {
+        // 回归：resolve 会刷新 last_seen，bind 的 5s 防并发分支因此拒绝改绑；
+        // 若不清除无效绑定，会话将永久粘死在不可用账号上（本用例锁定该缺陷）
+        let pool = build_pool(&[("A", 100.0, 0), ("B", 100.0, 0)]);
+        let store = crate::api_server::wb_sticky::StickyStore::new();
+        let key = sticky_key("conv-stale-003");
+        store.bind(&key, "A", "up-1", now_ts());
+        let _ = store.resolve(&key, now_ts()); // 刷新 last_seen（每次请求都会发生）
+
+        // 未清除时：改绑被 5s 让位分支拒绝（缺陷现象）
+        store.bind(&key, "B", "up-2", now_ts());
+        assert_eq!(store.resolve(&key, now_ts()).map(|b| b.uid), Some("A".into()));
+
+        // A 零积分 → 路由解除绑定 → 改绑生效
+        let mut snap = HashMap::new();
+        snap.insert("A".to_string(), (0.0, None));
+        pool.update_credits_snapshot(&snap);
+        assert_eq!(sticky_first_pick(&pool, &store, &key), None);
+        assert!(store.resolve(&key, now_ts()).is_none(), "无效绑定必须已解除");
+        store.bind(&key, "B", "up-2", now_ts());
+        assert_eq!(store.resolve(&key, now_ts()).map(|b| b.uid), Some("B".into()));
+    }
 }

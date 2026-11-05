@@ -361,6 +361,21 @@ impl StickyStore {
         );
     }
 
+    /// 解除单个会话键的绑定（2026-11 修复）。
+    /// 背景：`resolve` 每次命中都会把 `last_seen` 刷新到当前时刻，而 `bind` 的
+    /// 「5s 内换号让胜者」分支据此拒绝改绑——于是当绑定账号变为不可用
+    /// （零积分/冷却/禁用/被 Key 白名单排除）而请求实际换到别的账号后，
+    /// 绑定永远改不过去：会话被长期粘死在不可用账号上，每个请求都要先空跑
+    /// 一次粘性命中判定。路由侧检测到「有绑定但账号不可选」即调用本方法，
+    /// 让下一次成功请求重新绑到真正在用的账号。
+    pub fn remove(&self, key: &SessionKey) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let ck = self.full_key(key);
+        if map.remove(&ck).is_some() {
+            *self.last_save.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// 按账号解绑全部粘性绑定（issue #67）：账号进入硬冷却/禁用时调用，
     /// 清理其绑定避免其他会话在 TTL 窗口内反复解析到该账号（resolve 返回的
     /// Binding 还有调用方 pick_by_uid 的 selectable 校验兜底，此处为卫生性

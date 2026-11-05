@@ -233,7 +233,8 @@ async fn do_start_inner(
         ),
     );
 
-    // Buddy 池策略：wb_strategy 独立配置优先；空 = 跟随 Trae 池（与 pool_set 热应用逻辑一致）
+    // Buddy 池策略：wb_strategy 显式配置优先；空 = 加权公平轮转（WB 专属默认，
+    // 2026-11 修复；与 pool_set 热应用逻辑共用 PoolStrategy::resolve_wb）
     let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
