@@ -1,7 +1,9 @@
-//! workbuddy-auto 虚拟模型：WorkBuddy 侧的「模型级 + 账号级」智能调度。
+//! workbuddy-auto 虚拟模型：WorkBuddy 侧的「模型级 + 账号级」智能调度（V4 收费优先）。
 //!
 //! 定位（与既有 WB 管线的关系，刻意不重复实现）：
-//! - **模型级**决策在本模块：免费(rate==0) → 低倍率 → 高倍率（倍率升序）。
+//! - **模型级**决策在本模块。V4 阶段瀑布（按目标账号余额 + DeepSeek 预算）：
+//!   A 非 DeepSeek 低倍率收费 → B DeepSeek（独立安全预算）→ C 免费 → 下一账号。
+//!   阶段内按「真实倍率升序」排（不写死模型 ID），只向前（向免费）回退、不回退到更贵。
 //! - **账号级**轮换仍由 `wb_route::wb_aggregate_chat` / `wb_stream_chat` 内部的
 //!   账号循环负责（取号/粘性/CAS/故障转移一份实现），本模块只做两件事：
 //!   ① 把「本次实际选中的账号」取回来（`WbExecTrace`，见 wb_route）；
@@ -9,8 +11,11 @@
 //!
 //! 数据来源与不确定性（如实标注，不伪造）：
 //! - 免费身份：上游目录 `rate == 0.0`（`unified_catalog.rs` 既有语义「0 = 免费」）。
-//! - 每日免费额度**数值**：上游未提供查询接口 → 本模块记 UNKNOWN，仅依据真实响应
-//!   话术落状态；绝不自造额度数字，也不把网络/5xx/429/鉴权错误误判为额度耗尽。
+//! - DeepSeek **官方是否公布独立额度**：上游未提供查询接口 → 见报告；本模块只按
+//!   「每账号每周期保守预算」限制，绝不自造真实额度数字，也不把网络/5xx/429/鉴权
+//!   错误误判为额度耗尽。
+//! - DeepSeek 预算计量：为保 SSE 流式不缓冲响应体，用**保守估算**（按倍率缩放），
+//!   属试运行值、需按真实历史消耗校准。
 //! - 额度重置时刻：`reset_at` 仅在能从上文化术中解析到可靠时刻时填入；否则为 None，
 //!   此时只能由「后续成功调用的实证」恢复（不猜本地零点）。
 //! - 账号积分余额：由 `pool`/`wb_credits` 既有链路维护，本模块只读不改。
@@ -128,16 +133,135 @@ pub struct Candidate {
     pub model: String,
     pub rate: f64,
     pub free: bool,
+    /// 该候选所属调度阶段（V4：收费低倍率 → DeepSeek → 免费）
+    pub stage: Stage,
 }
 
-/// 规划候选顺序：免费（按 id 稳定） → 付费（倍率升序，同倍率按 id）
-/// `skip` 用于排除当前不可用（额度耗尽、模型冷却等）。
+// ==================== V4 调度阶段（收费优先） ====================
+//
+// 目标瀑布：稳定收费低倍率 → 余额约 250 时 DeepSeek 安全预算 → 免费模型 → 下一账号。
+// 不写死模型 ID：按「真实倍率 + 上游健康」排序，DeepSeek 系列从阶段 A 排除。
+
+/// 进入 DeepSeek 阶段的余额阈值（可配置；**不是** DeepSeek 真实额度）
+pub const DEFAULT_STAGE_B_BALANCE: f64 = 250.0;
+/// DeepSeek 每账号每周期保守试运行预算（积分；无官方上限时的安全值，可配置）
+pub const DEFAULT_DEEPSEEK_BUDGET: f64 = 50.0;
+/// 付费请求保留线（沿用上一轮：账号最后 50 积分不用于付费）
+pub const RESERVE_CREDITS: f64 = 50.0;
+/// 9934 账号「已实证今日 DeepSeek 耗尽」的人工确认日（东八区）；
+/// 到真实额度条目恢复（reset_at 到 / 成功实证清零）前持续跳过 DeepSeek 系列。
+pub const ACCOUNT_9934_DEEPSEEK_EXHAUSTED_DAY: &str = "2026-11-07";
+
+/// DeepSeek 单请求积分**保守估算**系数（est_credits = rate × 此值）。
+/// 为避免缓冲响应体（保 SSE 流式），预算计量用保守估算而非精确计费；
+/// 系数按倍率缩放（flash≈5.5、pro≈25.5），使高倍率更快触及预算。属试运行值，
+/// 需按真实历史消耗校准（规范 §二.2「根据实际历史证据调整」）。
+pub const DEFAULT_DEEPSEEK_CREDITS_PER_RATE: f64 = 50.0;
+
+/// 调度阶段（Ord：越小越优先/越贵，仅允许向前=向免费回退）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    /// A：非 DeepSeek 低倍率收费（稳定优先、倍率升序）
+    PaidLow = 0,
+    /// B：DeepSeek 系列（独立安全预算）
+    DeepSeek = 1,
+    /// C：免费模型（rate==0）
+    Free = 2,
+}
+
+/// 是否 DeepSeek 系列（按 id 识别，不写死到阶段逻辑）
+pub fn is_deepseek(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
+}
+
+/// 模型归属阶段：免费 → Free；DeepSeek 系列 → DeepSeek；其余收费 → PaidLow
+pub fn stage_of_model(model: &str, rate: f64) -> Stage {
+    if is_free_rate(rate) {
+        return Stage::Free;
+    }
+    if is_deepseek(model) {
+        return Stage::DeepSeek;
+    }
+    Stage::PaidLow
+}
+
+/// V4 调度上下文（纯输入，便于单测；生产由目标账号实况填充）
+#[derive(Clone, Debug)]
+pub struct PlanCtx {
+    /// 目标账号「可消费」余额（积分）
+    pub balance: f64,
+    /// 该账号本额度周期已耗 DeepSeek 积分
+    pub ds_spend: f64,
+    /// DeepSeek 安全预算（积分）
+    pub ds_budget: f64,
+    /// false = 该账号 DeepSeek 跳过（如 9934 未恢复）
+    pub deepseek_allowed: bool,
+    /// 进入 DeepSeek 阶段的余额阈值
+    pub stage_b_balance: f64,
+}
+
+impl Default for PlanCtx {
+    fn default() -> Self {
+        Self {
+            // 默认余额充裕 → 阶段 A（收费优先，安全默认）
+            balance: f64::INFINITY,
+            ds_spend: 0.0,
+            ds_budget: DEFAULT_DEEPSEEK_BUDGET,
+            deepseek_allowed: true,
+            stage_b_balance: DEFAULT_STAGE_B_BALANCE,
+        }
+    }
+}
+
+/// 由余额 + DeepSeek 预算 + 9934 规则决定当前调度阶段。
+pub fn stage_for(ctx: &PlanCtx) -> Stage {
+    // 付费保护线以下：任何付费（含 DeepSeek）都不再分配，只能免费
+    if ctx.balance <= RESERVE_CREDITS {
+        return Stage::Free;
+    }
+    // 余额充裕（> 阈值）：稳定低倍率收费优先（阶段 A）
+    if ctx.balance > ctx.stage_b_balance {
+        return Stage::PaidLow;
+    }
+    // 余额进入阈值区间（<=阈值 且 > 保留线）：DeepSeek 预算内 → DeepSeek
+    if ctx.deepseek_allowed && ctx.ds_spend < ctx.ds_budget {
+        return Stage::DeepSeek;
+    }
+    // DeepSeek 预算耗尽 / 9934 跳过 → 免费
+    Stage::Free
+}
+
+/// 9934 账号 DeepSeek 是否可调度：
+/// - 非 9934 → 恒可调度；
+/// - 人工确认耗尽日（2026-11-07）→ 跳过；
+/// - 其后仅当该账号 DeepSeek 额度条目已恢复（未处耗尽态）才恢复，不单凭本机日期清限。
+pub fn deepseek_allowed_for(uid: &str, now: i64, quota: &QuotaFile) -> bool {
+    if !uid.ends_with("9934") {
+        return true;
+    }
+    if period_of(now) == ACCOUNT_9934_DEEPSEEK_EXHAUSTED_DAY {
+        return false;
+    }
+    // 恢复依据真实额度条目（reset_at 到 / 成功清零后 account_model_blocked 为 false）
+    let uids = vec![uid.to_string()];
+    for m in ["deepseek-v4.1-flash", "deepseek-v4-pro"] {
+        if account_model_blocked(quota, uid, m, now) || model_blocked(quota, m, now, &uids) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 规划候选顺序（V4）：按当前阶段起、只向前（向免费）回退；不向更贵阶段回退。
+/// 排序：阶段升序（A→B→C）→ 倍率升序 → id 稳定。倍率未知 / 脏数据 / skip 者排除。
+/// `ctx.deepseek_allowed=false` 时 DeepSeek 候选一律排除（9934 等）。
 pub fn plan_candidates(
     models: &[wb_catalog::WbModel],
     skip: &dyn Fn(&str) -> bool,
+    ctx: &PlanCtx,
 ) -> Vec<Candidate> {
-    let mut free: Vec<Candidate> = Vec::new();
-    let mut paid: Vec<Candidate> = Vec::new();
+    let active = stage_for(ctx);
+    let mut out: Vec<Candidate> = Vec::new();
     for m in models {
         let rate = m.rate;
         if !rate.is_finite() {
@@ -146,27 +270,82 @@ pub fn plan_candidates(
         if skip(&m.id) {
             continue;
         }
-        let c = Candidate {
+        let stage = stage_of_model(&m.id, rate);
+        if stage < active {
+            continue; // 不回退到更贵阶段（余额不足时不得再分配不符合当前阶段的请求）
+        }
+        if stage == Stage::DeepSeek && !ctx.deepseek_allowed {
+            continue; // 9934 等：DeepSeek 系列跳过
+        }
+        out.push(Candidate {
             model: m.id.clone(),
             rate,
             free: is_free_rate(rate),
-        };
-        if c.free {
-            free.push(c);
-        } else if rate > 0.0 {
-            paid.push(c);
-        }
-        // rate < 0 属脏数据：跳过（既非免费也非可计价）
+            stage,
+        });
     }
-    free.sort_by(|a, b| a.model.cmp(&b.model));
-    paid.sort_by(|a, b| {
-        a.rate
-            .partial_cmp(&b.rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    out.sort_by(|a, b| {
+        a.stage
+            .cmp(&b.stage)
+            .then_with(|| {
+                a.rate
+                    .partial_cmp(&b.rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.model.cmp(&b.model))
     });
-    free.extend(paid);
-    free
+    out
+}
+
+// ==================== DeepSeek 预算（每账号每周期独立） ====================
+
+fn ds_key(uid: &str, period: &str) -> String {
+    format!("{uid}|{period}")
+}
+
+/// 读取该账号本周期已耗 DeepSeek 积分
+pub fn ds_spend(spends: &BTreeMap<String, f64>, uid: &str, period: &str) -> f64 {
+    spends.get(&ds_key(uid, period)).copied().unwrap_or(0.0)
+}
+
+/// 记一次 DeepSeek 消耗（credits 为实测/保守估算积分）
+pub fn note_ds_spend(spends: &mut BTreeMap<String, f64>, uid: &str, period: &str, credits: f64) {
+    if credits <= 0.0 {
+        return;
+    }
+    *spends.entry(ds_key(uid, period)).or_insert(0.0) += credits;
+}
+
+/// 该账号本周期 DeepSeek 是否已达安全预算
+pub fn ds_over_budget(spends: &BTreeMap<String, f64>, uid: &str, period: &str, budget: f64) -> bool {
+    ds_spend(spends, uid, period) >= budget
+}
+
+/// DeepSeek 单请求积分保守估算（按倍率缩放，见 DEFAULT_DEEPSEEK_CREDITS_PER_RATE）
+pub fn estimate_deepseek_credits(rate: f64) -> f64 {
+    if rate.is_finite() && rate > 0.0 {
+        rate * DEFAULT_DEEPSEEK_CREDITS_PER_RATE
+    } else {
+        0.0
+    }
+}
+
+/// 一次 DeepSeek 请求完成后记账（保守估算；不读响应体，保 SSE 流式）。
+/// 仅对 DeepSeek 系列模型累计；非 DeepSeek 调用 no-op。
+pub fn note_deepseek_spend(state: &ApiSharedState, uid: Option<&str>, model: &str, rate: f64) {
+    if !is_deepseek(model) {
+        return;
+    }
+    let Some(uid) = uid else { return };
+    let now = now_epoch();
+    let period = period_of(now);
+    let est = estimate_deepseek_credits(rate);
+    if est <= 0.0 {
+        return;
+    }
+    let mut spends = load_ds_spend(state);
+    note_ds_spend(&mut spends, uid, &period, est);
+    save_ds_spend(state, &spends);
 }
 
 // ==================== 错误分类（按真实话术，不猜状态码） ====================
@@ -269,6 +448,78 @@ fn save_file(state: &ApiSharedState, f: &QuotaFile) {
     let store = crate::store::db(&state.data_dir);
     let _ = store.kv_set(KV_KEY, f);
     crate::api_server::config_cache::invalidate(&state.data_dir, KV_KEY);
+}
+
+/// DeepSeek 预算消耗持久化键（每账号每周期独立累计）
+const DS_KV_KEY: &str = "wb_auto_ds_spend_v1";
+
+fn load_ds_spend(state: &ApiSharedState) -> BTreeMap<String, f64> {
+    let store = crate::store::db(&state.data_dir);
+    store.kv_get::<BTreeMap<String, f64>>(DS_KV_KEY)
+}
+
+fn save_ds_spend(state: &ApiSharedState, m: &BTreeMap<String, f64>) {
+    let store = crate::store::db(&state.data_dir);
+    let _ = store.kv_set(DS_KV_KEY, m);
+    crate::api_server::config_cache::invalidate(&state.data_dir, DS_KV_KEY);
+}
+
+/// 目标账号（ExpireFirst：最早到期优先；返回 (uid, 可消费余额)）。
+/// 供 V4 阶段决策使用——模型选择需反映「实际将服务的账号」余额/预算/9934 规则。
+/// 无可调度账号时返回 None（由下游 pool 报 no_healthy，不在这里伪造健康）。
+fn target_account(state: &ApiSharedState) -> Option<(String, f64)> {
+    let mut best: Option<(String, f64, bool, i64)> = None; // (uid, credits, has_expiry, expiry)
+    for d in state.wb_pool.diagnose() {
+        if d.disabled || !d.reason.is_empty() {
+            continue; // 仅可调度健康账号
+        }
+        let credits = d.credits.unwrap_or(0.0);
+        if credits <= RESERVE_CREDITS {
+            continue; // 低于保留线不作付费目标
+        }
+        let (has_exp, exp) = match d.credits_expire_at {
+            Some(t) if t > 0 => (true, t),
+            _ => (false, i64::MAX),
+        };
+        let better = match &best {
+            None => true,
+            Some((_, bc, bh, be)) => {
+                // ExpireFirst：有到期时间者优先；再比更早到期；再比余额更多
+                (has_exp, std::cmp::Reverse(exp), std::cmp::Reverse(credits))
+                    > (*bh, std::cmp::Reverse(*be), std::cmp::Reverse(*bc))
+            }
+        };
+        if better {
+            best = Some((d.uid, credits, has_exp, exp));
+        }
+    }
+    best.map(|(uid, credits, _, _)| (uid, credits))
+}
+
+/// 构造 V4 调度上下文（读目标账号余额 + DeepSeek 已耗 + 9934 规则）
+fn plan_ctx(state: &ApiSharedState) -> PlanCtx {
+    let now = now_epoch();
+    let period = period_of(now);
+    let spends = load_ds_spend(state);
+    let quota = load_file(state);
+    let (uid, balance) = target_account(state).unwrap_or((String::new(), f64::INFINITY));
+    let deepseek_allowed = if uid.is_empty() {
+        true
+    } else {
+        deepseek_allowed_for(&uid, now, &quota)
+    };
+    let ds_sp = if uid.is_empty() {
+        0.0
+    } else {
+        ds_spend(&spends, &uid, &period)
+    };
+    PlanCtx {
+        balance,
+        ds_spend: ds_sp,
+        ds_budget: DEFAULT_DEEPSEEK_BUDGET,
+        deepseek_allowed,
+        stage_b_balance: DEFAULT_STAGE_B_BALANCE,
+    }
 }
 
 /// 单条状态是否仍生效（同周期且未到重置时刻）
@@ -414,10 +665,18 @@ fn candidates_now(state: &Arc<ApiSharedState>) -> Result<Vec<Candidate>, Respons
     let now = now_epoch();
     let uids = pool_uids(state);
     let view = wb_route::WbView::wb(state.clone());
-    Ok(plan_candidates(&catalog, &|id: &str| {
-        model_blocked(&f, id, now, &uids)
-            || wb_route::model_cooling_remaining(&view, id).is_some()
-    }))
+    let ctx = plan_ctx(state);
+    Ok(plan_candidates(
+        &catalog,
+        &|id: &str| {
+            model_blocked(&f, id, now, &uids)
+                || wb_route::model_cooling_remaining(&view, id).is_some()
+                // 本轮修复：该模型在该池**所有**可调度账号上都已触发上游限流 →
+                // 本轮直接跳过，由下一个候选（阶段内向前回退）接管。
+                || wb_route::model_exhausted_for_all_accounts(&view, id)
+        },
+        &ctx,
+    ))
 }
 
 /// 调度日志（不含任何凭据；uid 仅本地日志可见，不回传客户端）
@@ -519,6 +778,8 @@ pub async fn aggregate_auto(
             clear_on_success(&mut f, uid.as_deref(), &cand.model);
             f.version = 1;
             save_file(&state, &f);
+            // DeepSeek 预算记账（保守估算；仅 DeepSeek 系列累计）
+            note_deepseek_spend(&state, uid.as_deref(), &cand.model, cand.rate);
             log_decision(
                 &state,
                 uid.as_deref(),
@@ -587,7 +848,33 @@ pub async fn aggregate_auto(
                 continue; // 换下一个模型
             }
             None => {
-                // 非额度类（网络/5xx/429/鉴权/审核）：保留原响应，不盲目换模型
+                // 本轮修复：429 属「账号×模型」额度窗口（非整账号、非额度耗尽），
+                // 聚合路径响应尚未下发给客户端 → 标记该组合后**换下一个模型**，
+                // 而不是把 429 原样抛给客户端让整条任务失败。
+                // 旧行为：`classify()` 对 429 明确返回 None（不误判为额度耗尽），
+                // 但也因此直接 passthrough，自动切换链路在此断掉。
+                if parts.status == StatusCode::TOO_MANY_REQUESTS {
+                    if let Some(u) = uid.as_deref() {
+                        wb_route::note_account_model_failure(
+                            &wb_route::WbView::wb(state.clone()),
+                            u,
+                            &cand.model,
+                            Some(&text),
+                        );
+                    }
+                    log_decision(
+                        &state,
+                        uid.as_deref(),
+                        &cand.model,
+                        cand.rate,
+                        cand.free,
+                        "rate_limited_switch_next",
+                        &tried,
+                    );
+                    last = Some(Response::from_parts(parts, Body::from(bytes)));
+                    continue; // 换下一个模型
+                }
+                // 非额度类（网络/5xx/鉴权/审核）：保留原响应，不盲目换模型
                 log_decision(
                     &state,
                     uid.as_deref(),
@@ -611,8 +898,12 @@ pub async fn aggregate_auto(
     })
 }
 
-/// 流式：按策略取首个候选直接流式（SSE 首字下发后不可回退）；
-/// 失败仅落状态供下次决策参考，不在流内重试。
+/// 流式：按策略取首个**可用**候选直接流式（SSE 首字下发后不可回退）。
+///
+/// 本轮修复：首字节前可切换。`wb_route::wb_stream_chat` 现在会在提交 200/SSE
+/// 之前做池内预检，发现「该模型在所有可调度账号上都被限流」时返回真实 HTTP 429；
+/// 由于此时一字节未出，可以安全地换下一个候选（免费 → 低倍率 → 高倍率）。
+/// SSE 一旦开始输出正文/工具调用，本函数不再重放整次请求（避免重复生成与扣费）。
 pub fn stream_auto(
     state: Arc<ApiSharedState>,
     mut chat_body: Value,
@@ -624,47 +915,75 @@ pub fn stream_auto(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    let Some(cand) = cands.first() else {
+    if cands.is_empty() {
         return super::routes::openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "auto_unavailable",
-            "workbuddy-auto：目录内无可用候选",
+            "workbuddy-auto：目录内无可用候选（免费与付费模型均被限流/耗尽）",
         );
-    };
-    chat_body["model"] = Value::String(cand.model.clone());
-    chat_body["stream"] = Value::Bool(true);
-    let body_vec = serde_json::to_vec(&chat_body).unwrap_or_default();
-    let start_ts = std::time::Instant::now();
-    let guard = state.inflight_guard();
-    let trace = wb_route::WbExecTrace::new();
-    let resp = wb_route::wb_stream_chat(
-        state.clone(),
-        false,
-        body_vec,
-        cand.model.clone(),
-        start_ts,
-        proto,
-        key_str,
-        guard,
-        encoded,
-        Some(trace.clone()),
-    );
-    log_decision(
-        &state,
-        trace.uid().as_deref(),
-        &cand.model,
-        cand.rate,
-        cand.free,
-        "stream_start",
-        &[cand.model.clone()],
-    );
-    tag(
-        resp,
-        &cand.model,
-        cand.rate,
-        cand.free,
-        &[cand.model.clone()],
-        None,
+    }
+    let total = cands.len();
+    let mut tried: Vec<String> = Vec::new();
+    for (idx, cand) in cands.iter().enumerate() {
+        // 免费模型做并发额度占用保护；付费模型按积分消耗，不占免费槽
+        let reserved = cand.free && try_reserve(&cand.model);
+        if cand.free && !reserved {
+            continue;
+        }
+        tried.push(cand.model.clone());
+        chat_body["model"] = Value::String(cand.model.clone());
+        chat_body["stream"] = Value::Bool(true);
+        let body_vec = serde_json::to_vec(&chat_body).unwrap_or_default();
+        let start_ts = std::time::Instant::now();
+        let guard = state.inflight_guard();
+        let trace = wb_route::WbExecTrace::new();
+        let resp = wb_route::wb_stream_chat(
+            state.clone(),
+            false,
+            body_vec,
+            cand.model.clone(),
+            start_ts,
+            proto,
+            key_str.clone(),
+            guard,
+            encoded.clone(),
+            Some(trace.clone()),
+        );
+        if cand.free {
+            release(&cand.model);
+        }
+        // 首字节前失败（预检 429）：一字节未出，换下一个候选是安全的
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS && idx + 1 < total {
+            log_decision(
+                &state,
+                trace.uid().as_deref(),
+                &cand.model,
+                cand.rate,
+                cand.free,
+                "stream_precheck_switch_next",
+                &tried,
+            );
+            continue;
+        }
+        log_decision(
+            &state,
+            trace.uid().as_deref(),
+            &cand.model,
+            cand.rate,
+            cand.free,
+            if resp.status().is_success() { "stream_start" } else { "stream_precheck_reject" },
+            &tried,
+        );
+        // 流式成功启动即记 DeepSeek 预算（保守估算；SSE 提交后不再中断）
+        if resp.status().is_success() {
+            note_deepseek_spend(&state, trace.uid().as_deref(), &cand.model, cand.rate);
+        }
+        return tag(resp, &cand.model, cand.rate, cand.free, &tried, None);
+    }
+    super::routes::openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "auto_unavailable",
+        &format!("workbuddy-auto：候选全部在上游限流（已尝试 {}）", tried.join(", ")),
     )
 }
 
@@ -755,36 +1074,53 @@ mod tests {
         }
     }
 
+    fn ctx_bal(balance: f64) -> PlanCtx {
+        PlanCtx {
+            balance,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn free_first_then_rate_ascending() {
+    fn v4_balance_300_prefers_non_deepseek_low_rate() {
+        // 场景 1：余额 300 → 非 DeepSeek 低倍率收费优先；DeepSeek 全排除于阶段 A 之外靠 stage 排序殿后
         let models = vec![
             m("paid-big", 1.5),
-            m("paid-low", 0.2),
+            m("deepseek-v4.1-flash", 0.11),
+            m("glm-5.3-flash", 0.08),
             m("free-b", 0.0),
-            m("free-a", 0.0),
-            m("paid-mid", 0.69),
+            m("mimo-v2.6-pro", 0.13),
         ];
-        let plan = plan_candidates(&models, &|_| false);
+        let plan = plan_candidates(&models, &|_| false, &ctx_bal(300.0));
         let ids: Vec<&str> = plan.iter().map(|c| c.model.as_str()).collect();
+        // 阶段 A（非 DeepSeek 收费，倍率升序）在前：0.08 → 0.13 → 1.5；随后 DeepSeek(0.11)；最后免费
         assert_eq!(
             ids,
-            vec!["free-a", "free-b", "paid-low", "paid-mid", "paid-big"]
+            vec![
+                "glm-5.3-flash",
+                "mimo-v2.6-pro",
+                "paid-big",
+                "deepseek-v4.1-flash",
+                "free-b"
+            ]
         );
-        assert!(plan[0].free && plan[1].free && !plan[2].free);
+        assert_eq!(plan[0].stage, Stage::PaidLow);
+        assert!(!is_deepseek(&plan[0].model), "首选不得是 DeepSeek");
     }
 
     #[test]
     fn nan_rate_not_treated_as_free() {
         let models = vec![m("unknown", f64::NAN), m("paid", 0.5), m("free", 0.0)];
-        let plan = plan_candidates(&models, &|_| false);
+        let plan = plan_candidates(&models, &|_| false, &ctx_bal(300.0));
         let ids: Vec<&str> = plan.iter().map(|c| c.model.as_str()).collect();
-        assert_eq!(ids, vec!["free", "paid"], "倍率未知的模型不得参与自动调度");
+        // 余额 300 → 阶段 A 起：paid(0.5) 在 free 之前；unknown 因 NaN 被排除
+        assert_eq!(ids, vec!["paid", "free"], "倍率未知的模型不得参与自动调度");
         assert!(!is_free_rate(f64::NAN));
     }
 
     #[test]
-    fn exhausted_free_switches_to_next_then_paid() {
-        // 模拟：free-a 耗尽后应跳到 free-b；两个免费都耗尽后进入最低倍率付费
+    fn exhausted_free_switches_to_next_free() {
+        // 免费阶段（余额低 + 预算耗尽）：free-a 耗尽后跳 free-b（同阶段向前）
         let models = vec![m("free-a", 0.0), m("free-b", 0.0), m("paid-low", 0.1)];
         let mut f = QuotaFile::default();
         let now = 1_760_000_000;
@@ -799,11 +1135,13 @@ mod tests {
             None,
         );
         let uids = vec!["uid-a".to_string()];
-        let plan = plan_candidates(&models, &|id| model_blocked(&f, id, now, &uids));
+        // 余额 40（<= 保留线 50）→ 阶段 C（免费），不回退到付费
+        let ctx = ctx_bal(40.0);
+        let plan = plan_candidates(&models, &|id| model_blocked(&f, id, now, &uids), &ctx);
         let ids: Vec<&str> = plan.iter().map(|c| c.model.as_str()).collect();
-        assert_eq!(ids, vec!["free-b", "paid-low"]);
+        assert_eq!(ids, vec!["free-b"], "免费阶段 free-a 耗尽后只在免费内向前，不回退付费");
 
-        // 再耗尽 free-b → 只剩付费
+        // 再耗尽 free-b → 无免费候选（交由账号切换，不强行回退付费）
         mark(
             &mut f,
             "uid-a",
@@ -814,9 +1152,8 @@ mod tests {
             now,
             None,
         );
-        let plan = plan_candidates(&models, &|id| model_blocked(&f, id, now, &uids));
-        let ids: Vec<&str> = plan.iter().map(|c| c.model.as_str()).collect();
-        assert_eq!(ids, vec!["paid-low"], "免费全部耗尽后进入低倍率付费");
+        let plan = plan_candidates(&models, &|id| model_blocked(&f, id, now, &uids), &ctx);
+        assert!(plan.is_empty(), "免费全部耗尽且余额低于保留线 → 无候选（转账号切换）");
     }
 
     #[test]
@@ -889,8 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn period_buckets_by_utc_plus_8() {
-        // 2026-11-05 00:00:00 +08:00 == 2026-11-04 16:00:00 UTC
+    fn period_buckets_by_utc_plus_8() {        // 2026-11-05 00:00:00 +08:00 == 2026-11-04 16:00:00 UTC
         let epoch = 1_762_272_000; // 2025-11-05T16:00:00Z 附近的固定点
         assert_eq!(period_of(epoch).len(), 10);
         // 相差一个自然日 → 分桶必须不同
@@ -916,6 +1252,233 @@ mod tests {
             classify(400, "insufficient credits for this request"),
             Some(QuotaStatus::CreditExhausted)
         );
+    }
+
+    /// 并发额度占用：同一模型的免费额度槽位同一时刻只允许一个请求占用，
+    /// 其余必须失败（不得两个并发请求都以为「自己拿到了免费额度」）
+    #[test]
+    fn concurrent_free_slot_has_single_holder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let model = "concurrent-free-slot-probe";
+        release(model);
+        let won = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let won = won.clone();
+            handles.push(std::thread::spawn(move || {
+                if try_reserve(model) {
+                    won.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    release(model);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("线程不应 panic");
+        }
+        assert_eq!(won.load(Ordering::SeqCst), 1, "并发下只允许一个持有者");
+        assert!(try_reserve(model), "全部释放后应可再次占用");
+        release(model);
+    }
+
+    /// 并发写额度状态：不同账号的状态互不覆盖，同账号同模型同周期幂等（不膨胀）
+    #[test]
+    fn concurrent_marks_stay_per_account_and_idempotent() {
+        use std::sync::Mutex;
+        let now = 1_760_000_000;
+        let shared = Arc::new(Mutex::new(QuotaFile::default()));
+        let uids = ["uid-a", "uid-b", "uid-c", "uid-d"];
+        let mut handles = Vec::new();
+        for uid in uids {
+            let shared = shared.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let mut f = shared.lock().unwrap();
+                    mark(
+                        &mut f,
+                        uid,
+                        "free-a",
+                        QuotaStatus::FreeExhausted,
+                        "免费额度耗尽",
+                        "free quota exhausted",
+                        now,
+                        None,
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("线程不应 panic");
+        }
+        {
+            let f = shared.lock().unwrap();
+            assert_eq!(f.entries.len(), 4, "每个账号只有一条状态，不得重复膨胀");
+            for uid in uids {
+                assert!(
+                    account_model_blocked(&f, uid, "free-a", now),
+                    "{uid} 的状态必须独立成立"
+                );
+                let e = f
+                    .entries
+                    .values()
+                    .find(|e| e.uid == uid)
+                    .expect("条目必须存在");
+                assert_eq!(e.model, "free-a");
+                assert_eq!(e.status, QuotaStatus::FreeExhausted);
+            }
+            // 一个账号成功调用只清除自己的状态
+            let mut f = f;
+            clear_on_success(&mut f, Some("uid-a"), "free-a");
+            assert!(!account_model_blocked(&f, "uid-a", "free-a", now));
+            for uid in ["uid-b", "uid-c", "uid-d"] {
+                assert!(
+                    account_model_blocked(&f, uid, "free-a", now),
+                    "{uid} 不得被别的账号的成功调用清除"
+                );
+            }
+        }
+    }
+
+    // ==================== V4 阶段/预算/9934 场景 ====================
+
+    #[test]
+    fn v4_stage_transitions_by_balance_and_budget() {
+        // 场景 2：余额 260（>250）→ 阶段 A；245（≤250）→ 阶段 B（DeepSeek）
+        assert_eq!(stage_for(&ctx_bal(300.0)), Stage::PaidLow);
+        assert_eq!(stage_for(&ctx_bal(260.0)), Stage::PaidLow);
+        let mut c = ctx_bal(245.0);
+        c.ds_spend = 0.0;
+        assert_eq!(stage_for(&c), Stage::DeepSeek, "余额降到 245 → 下次进入 DeepSeek 阶段");
+
+        // 场景 3：DeepSeek 达到安全预算 → 阶段 C（免费）
+        c.ds_spend = DEFAULT_DEEPSEEK_BUDGET;
+        assert_eq!(stage_for(&c), Stage::Free, "DeepSeek 预算耗尽 → 切免费");
+
+        // 余额 ≤ 保留线：任何付费都停，只能免费
+        assert_eq!(stage_for(&ctx_bal(40.0)), Stage::Free);
+        assert_eq!(stage_for(&ctx_bal(RESERVE_CREDITS)), Stage::Free);
+    }
+
+    #[test]
+    fn v4_deepseek_budget_accounting() {
+        let mut spends = BTreeMap::new();
+        assert_eq!(ds_spend(&spends, "u1", "2026-11-07"), 0.0);
+        note_ds_spend(&mut spends, "u1", "2026-11-07", 30.0);
+        note_ds_spend(&mut spends, "u1", "2026-11-07", 25.0);
+        assert_eq!(ds_spend(&spends, "u1", "2026-11-07"), 55.0, "同账号同周期累计");
+        // 账号维度隔离：另一账号不共享预算
+        assert_eq!(ds_spend(&spends, "u2", "2026-11-07"), 0.0);
+        // 周期维度隔离
+        assert_eq!(ds_spend(&spends, "u1", "2026-11-08"), 0.0);
+        assert!(ds_over_budget(&spends, "u1", "2026-11-07", 50.0));
+        assert!(!ds_over_budget(&spends, "u2", "2026-11-07", 50.0));
+        // 估算按倍率缩放（flash 低、pro 高），且 > 0
+        assert!(estimate_deepseek_credits(0.11) > 0.0);
+        assert!(
+            estimate_deepseek_credits(0.51) > estimate_deepseek_credits(0.11),
+            "高倍率应更快消耗预算"
+        );
+    }
+
+    #[test]
+    fn v4_9934_deepseek_skip_until_recovered() {
+        let now_1107 = 1_794_024_000; // 2026-11-07 12:00 UTC+8
+        let quota = QuotaFile::default();
+        // 场景 4：9934 在 2026-11-07 → 不调用 DeepSeek
+        assert!(!deepseek_allowed_for("wb-e1015c8f7-9934", now_1107, &quota));
+        // 非 9934 → 恒可调度
+        assert!(deepseek_allowed_for("wb-other-1234", now_1107, &quota));
+
+        // 场景 5：11-08 但真实额度条目仍处耗尽（未 reset）→ 仍不调用
+        let now_1108 = now_1107 + 86_400;
+        let mut q2 = QuotaFile::default();
+        mark(
+            &mut q2,
+            "wb-e1015c8f7-9934",
+            "deepseek-v4.1-flash",
+            QuotaStatus::FreeExhausted,
+            "t",
+            "DeepSeek 额度耗尽",
+            now_1108,
+            None, // 无 reset_at → 只能靠成功实证恢复
+        );
+        assert!(
+            !deepseek_allowed_for("wb-e1015c8f7-9934", now_1108, &q2),
+            "真实额度未恢复前持续跳过"
+        );
+
+        // 额度条目到 reset_at 后恢复 → 恢复 DeepSeek 候选
+        let mut q3 = QuotaFile::default();
+        mark(
+            &mut q3,
+            "wb-e1015c8f7-9934",
+            "deepseek-v4.1-flash",
+            QuotaStatus::FreeExhausted,
+            "t",
+            "DeepSeek 额度耗尽",
+            now_1108,
+            Some(now_1108 + 60),
+        );
+        assert!(
+            deepseek_allowed_for("wb-e1015c8f7-9934", now_1108 + 61, &q3),
+            "reset_at 到 → 恢复候选（不单凭本机日期硬清）"
+        );
+    }
+
+    #[test]
+    fn v4_9934_plan_excludes_deepseek() {
+        // 余额 245（本应 DeepSeek 阶段）但 9934 跳过 DeepSeek → 直接免费
+        let models = vec![
+            m("deepseek-v4.1-flash", 0.11),
+            m("glm-5.3-flash", 0.08),
+            m("hy4free", 0.0),
+        ];
+        let mut c = ctx_bal(245.0);
+        c.deepseek_allowed = false;
+        let plan = plan_candidates(&models, &|_| false, &c);
+        let ids: Vec<&str> = plan.iter().map(|x| x.model.as_str()).collect();
+        assert_eq!(ids, vec!["hy4free"], "9934 跳过 DeepSeek，245 余额直接免费");
+        assert!(ids.iter().all(|i| !is_deepseek(i)));
+    }
+
+    #[test]
+    fn v4_free_a_429_falls_to_free_b_no_account_cool() {
+        // 场景 6：免费 A 429 → 尝试免费 B，且不误冷却整个账号
+        let models = vec![m("hy4free", 0.0), m("hy3", 0.0)];
+        let mut f = QuotaFile::default();
+        let now = 1_760_000_000;
+        // hy4free 仅在 uid-a 上额度耗尽（模型级）→ 跳到 hy3
+        mark(&mut f, "uid-a", "hy4free", QuotaStatus::FreeExhausted, "t", "x", now, None);
+        let uids = vec!["uid-a".to_string()];
+        let ctx = ctx_bal(40.0); // 免费阶段
+        let plan = plan_candidates(&models, &|id| model_blocked(&f, id, now, &uids), &ctx);
+        let ids: Vec<&str> = plan.iter().map(|x| x.model.as_str()).collect();
+        assert_eq!(ids, vec!["hy3"], "免费 A 耗尽 → 免费 B");
+        // 关键：仅冷却 uid-a 的 hy4free，uid-a 在 hy3 上仍可用（未整账号冷却）
+        assert!(!account_model_blocked(&f, "uid-a", "hy3", now));
+    }
+
+    #[test]
+    fn v4_context_overflow_not_quota_exhaustion() {
+        // 场景 10：上下文超限 → 不误判额度耗尽
+        assert_eq!(
+            classify(400, "prompt is too long: 1124459 tokens > 1048576 maximum"),
+            None
+        );
+        assert_eq!(classify(400, "context length exceeded maximum"), None);
+        assert_eq!(classify(413, "request entity too large"), None);
+    }
+
+    #[test]
+    fn v4_account_level_restriction_still_blocks_model() {
+        // 场景 8：上游账号级限制（全部账号在该模型耗尽）→ 严格遵守，模型整体跳过
+        let mut f = QuotaFile::default();
+        let now = 1_760_000_000;
+        for u in ["uid-a", "uid-b"] {
+            mark(&mut f, u, "deepseek-v4.1-flash", QuotaStatus::CreditExhausted, "t", "账号积分不足", now, None);
+        }
+        let uids = vec!["uid-a".to_string(), "uid-b".to_string()];
+        assert!(model_blocked(&f, "deepseek-v4.1-flash", now, &uids));
     }
 }
 
@@ -1069,7 +1632,7 @@ mod integration_tests {
         let uids = vec!["A".to_string()];
 
         let ids = |f: &QuotaFile| -> Vec<String> {
-            plan_candidates(&models, &|id| model_blocked(f, id, now, &uids))
+            plan_candidates(&models, &|id| model_blocked(f, id, now, &uids), &PlanCtx::default())
                 .into_iter()
                 .map(|c| c.model)
                 .collect()

@@ -34,6 +34,18 @@ pub(crate) fn wb_reserve_credits(global: f64) -> f64 {
     }
 }
 
+/// WorkBuddy 池调度口径（2026-11 收敛，产品硬规则三条）：
+/// 1. 账号顺序固定为「积分到期最早的账号优先」（不做公平轮转、不做防饥饿）；
+/// 2. 保留线 50 严格生效（剩余 ≤ 50 停止派单，不看积分快照新鲜度）；
+/// 3. 关闭 100ms 防惊群让位，避免快速连续请求把请求摊给非最早到期账号。
+///
+/// 仅作用于 WB 池；Trae / Qoder / BuddyAI 三池装配路径完全不经过本函数。
+pub(crate) fn apply_wb_scheduling_profile(pool: &ApiPool) {
+    pool.set_strategy(crate::api_server::pool::PoolStrategy::resolve_wb("", ""));
+    pool.set_strict_reserve(true);
+    pool.set_deterministic_pick(true);
+}
+
 /// 运行时状态：服务器句柄 + 共享状态
 pub struct ApiServerRuntime {
     pub handle: ApiServerHandle,
@@ -242,6 +254,8 @@ async fn do_start_inner(
     // 产品线隔离：Trae / Qoder / BuddyAI 三池严格沿用全局 dispatch_policy.reserve_credits，
     // 本规则只作用于 WB 池；用户显式配置高于 50 时取更高值（不擅自取消 50 底线）。
     wb_pool.set_reserve_credits(wb_reserve_credits(reserve_credits));
+    // WB 调度口径（最早到期优先 + 严格 50 保留线 + 确定性取号）
+    apply_wb_scheduling_profile(&wb_pool);
     qoder_pool.set_reserve_credits(reserve_credits);
     buddy_ai_pool.set_reserve_credits(reserve_credits);
     let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
@@ -256,18 +270,22 @@ async fn do_start_inner(
         ),
     );
 
-    // Buddy 池策略：wb_strategy 显式配置优先；空 = 加权公平轮转（WB 专属默认，
-    // 2026-11 修复；与 pool_set 热应用逻辑共用 PoolStrategy::resolve_wb）
+    // Buddy 池策略：固定「最早到期优先」（2026-11 收敛，产品硬规则；
+    // 与 pool_set 热应用逻辑共用 PoolStrategy::resolve_wb + apply_wb_scheduling_profile）。
+    // 日志里仍打印实际生效策略，便于核对升级后口径
     let wb_strategy = crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy);
     let wb_healthy = wb_pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={} whitelist={} (total_accounts={})",
+            "API服务启动-WB上游池: enabled={} accounts={} healthy={} strategy={} reserve_floor={} reserve_strict={} deterministic_pick={} whitelist={} (total_accounts={})",
             pool_file.wb_enabled,
             wb_pool.count(),
             wb_healthy,
             wb_strategy.as_str(),
+            wb_pool.reserve_credits(),
+            wb_pool.strict_reserve() as u8,
+            wb_pool.deterministic_pick() as u8,
             wb_uids_len,
             wb_accounts_total,
         ),
@@ -399,6 +417,8 @@ async fn do_start_inner(
         custom_lb_counters: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
         total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -1486,9 +1506,8 @@ pub fn pool_set(
         rt.shared
             .pool
             .set_strategy(crate::api_server::pool::PoolStrategy::parse(&pool_file.strategy));
-        rt.shared.wb_pool.set_strategy(
-            crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
-        );
+        // WB 池：策略 + 严格保留线 + 确定性取号一并热应用（口径与启动一致）
+        apply_wb_scheduling_profile(&rt.shared.wb_pool);
         // Qoder 池策略热应用（空 = 跟随 Trae 池，与启动逻辑一致）
         rt.shared.qoder_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_qoder(&pool_file.strategy, &pool_file.qoder_strategy),

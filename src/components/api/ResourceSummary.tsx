@@ -44,8 +44,8 @@ function Row({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
-/** 池内调度策略取值（Trae / Buddy 同一套，pool.rs PoolStrategy） */
-const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c', 'fair_rotation'] as const;
+/** 池内调度策略取值（pool.rs PoolStrategy；fair_rotation 已于 2026-11 移除） */
+const STRATEGIES = ['expire_first', 'credit_first', 'random', 'weighted', 'p2c'] as const;
 
 /** 池内调度策略文案（与账号池选择下拉一致） */
 const STRATEGY_LABELS: Record<string, string> = {
@@ -54,7 +54,8 @@ const STRATEGY_LABELS: Record<string, string> = {
   random: '随机',
   weighted: '三因子加权随机',
   p2c: 'P2C 随机二选一',
-  fair_rotation: '加权公平轮转',
+  // 历史配置残留值：后端解析时回退到 expire_first，此处仅用于正确展示旧数据
+  fair_rotation: '积分先过期优先（fair_rotation 已废弃）',
 };
 
 const POOL_LABELS: Record<string, string> = {
@@ -556,22 +557,13 @@ function DispatchCenterCard({
             </label>
           )}
           {isPoolVisible(settings, 'buddy') && (
-            <label className="flex items-center gap-2">
+            <span className="flex items-center gap-2">
               <span className="text-slate-400 dark:text-zinc-500">Buddy 池</span>
-              <select
-                className={selectCls}
-                value={pool?.wb_strategy ?? ''}
-                disabled={!pool || saving}
-                onChange={(e) => void save({ buddy: e.target.value })}
-              >
-                <option value="">加权公平轮转（默认）</option>
-                {STRATEGIES.map((s) => (
-                  <option key={s} value={s}>
-                    {STRATEGY_LABELS[s]}
-                  </option>
-                ))}
-              </select>
-            </label>
+              {/* WB 账号调度为产品固定规则：最早到期优先 + 50 积分保留线，不可选 */}
+              <span className="text-slate-700 dark:text-zinc-200">
+                积分先过期优先（固定：到期最早账号优先，剩余 ≤ 50 停止派单）
+              </span>
+            </span>
           )}
           {isPoolVisible(settings, 'qoder') && (
             <label className="flex items-center gap-2">
@@ -582,7 +574,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ qoder: e.target.value })}
               >
-                <option value="">加权公平轮转（默认）</option>
+                <option value="">跟随 Trae 池（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -600,7 +592,7 @@ function DispatchCenterCard({
                 disabled={!pool || saving}
                 onChange={(e) => void save({ buddyAi: e.target.value })}
               >
-                <option value="">加权公平轮转（默认）</option>
+                <option value="">跟随 Trae 池（默认）</option>
                 {STRATEGIES.map((s) => (
                   <option key={s} value={s}>
                     {STRATEGY_LABELS[s]}
@@ -687,12 +679,8 @@ export default function ResourceSummary() {
     buddyAiAccounts,
     tags,
   );
-  // Buddy 池内策略文案：空 = 跟随 Trae 池（展示 Trae 当前生效策略）
-  const buddyStrategyText = pool?.wb_strategy
-    ? (STRATEGY_LABELS[pool.wb_strategy] ?? pool.wb_strategy)
-    : pool?.strategy
-      ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
-      : '—';
+  // Buddy 池内策略文案：固定「积分先过期优先」（2026-11 产品规则，不可配置）
+  const buddyStrategyText = '积分先过期优先（固定）';
   // Qoder 池内策略文案：空 = 跟随 Trae 池（同 Buddy 语义）
   const qoderStrategyText = pool?.qoder_strategy
     ? (STRATEGY_LABELS[pool.qoder_strategy] ?? pool.qoder_strategy)

@@ -118,6 +118,18 @@ impl WbView {
         }
     }
 
+    /// 账号×模型级冷却表视图（本轮修复；CN/Intl 独立实例，与模型级冷却同口径隔离）。
+    /// key 形如 `<uid>|<model>`，只冷却「该账号 × 该模型」组合
+    pub fn route_model_account_cooldowns(
+        &self,
+    ) -> &Mutex<std::collections::HashMap<String, (i64, u32)>> {
+        if self.buddy_ai {
+            &self.state.buddy_ai_model_account_cooldowns
+        } else {
+            &self.state.wb_model_account_cooldowns
+        }
+    }
+
     /// 池标签（请求日志 pool 列 + Key 白名单约束作用域）
     pub fn pool_label(&self) -> &'static str {
         if self.buddy_ai { "buddy-ai" } else { "buddy" }
@@ -473,6 +485,198 @@ fn parse_relative_unfreeze_secs(msg: &str) -> Option<i64> {
 pub fn clear_model_failure(state: &WbView, model: &str) {
     safe_lock(&state.route_model_cooldowns()).remove(model);
 }
+
+// ==================== 账号×模型级冷却（本轮修复：429 精准归因） ====================
+//
+// 设计要点（与既有两层冷却的关系，刻意不重复实现）：
+// - **模型级**（`model_cooldowns`，key=model）：整池同名模型都不可用（网关/模型级故障）。
+// - **账号级**（`pool` 的 `until`/`hard_until`）：账号/凭据/积分维度不可用。
+// - **账号×模型级**（本组函数，key=`uid|model`）：上游限额只打掉某账号某模型的
+//   「额度窗口」，其余模型照常。这是 429 的默认归属。
+
+/// 429/限流的作用范围（严格按上游语义判定，不做无依据的扩大解释）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateScope {
+    /// 账号在该模型上的额度/频率窗口耗尽 —— 只冷却 `uid|model`
+    Model,
+    /// 账号/凭据/工作区整体受限 —— 继续按账号级冷却（遵守上游解冻时刻）
+    Account,
+}
+
+/// 判定 429 的作用范围。
+///
+/// 判定口径（有意保守，且只影响「冷却粒度」不影响「是否遵守上游限制」）：
+/// - 上游文案**明确**出现账号/凭据/工作区/租户等整体性限定词 → [`RateScope::Account`]；
+/// - 其余一律 → [`RateScope::Model`]（含 WB 实测文案「您于 X UTC+8 触发限额，
+///   将在 Y UTC+8 重置」——该文案不带范围限定词）。
+///
+/// 为什么默认 Model 是安全的：
+/// - 真账号被封禁/风控走 11140 → `ErrKind::Forbidden`（禁用 + 解绑粘性），不经过本函数；
+/// - 若上游实际是账号级限流，则每个模型首次命中都会写各自的 `uid|model` 行，
+///   最终同样收敛为「该账号全部模型不可用」，只是多撞几次而非漏判；
+/// - 反向（默认 Account）会把一个模型的额度窗口放大成整账号 4~12h 停摆——
+///   即本轮要修的生产事故，代价远大于多撞几次。
+pub fn classify_rate_scope(msg: &str) -> RateScope {
+    let m = msg.to_ascii_lowercase();
+    // 整体性限定词：出现即认定账号级（宁可多冷却账号，也不漏掉真实账号级限制）
+    const ACCOUNT: &[&str] = &[
+        "your account",
+        "account has been",
+        "account is restricted",
+        "account level",
+        "account-level",
+        "all models",
+        "across all",
+        "credential",
+        "workspace",
+        "organization",
+        "tenant",
+        "账号",
+        "登录态",
+        "登录状态",
+        "凭据",
+        "工作区",
+        "企业",
+        "租户",
+        "所有模型",
+        "全部模型",
+        "全局",
+    ];
+    if ACCOUNT.iter().any(|k| m.contains(k)) {
+        RateScope::Account
+    } else {
+        RateScope::Model
+    }
+}
+
+/// `uid|model` 冷却键（分隔符 `|` 不会出现在 uid（`wb-<hex>`）与模型 id 中）
+fn account_model_key(uid: &str, model: &str) -> String {
+    format!("{uid}|{model}")
+}
+
+/// 从 `uid|model` 键解析 uid（模型 id 不含 `|`，故首个分隔符即分界）
+fn uid_of_key(key: &str) -> Option<&str> {
+    key.split_once('|').map(|(u, _)| u)
+}
+
+/// 计算一次账号×模型限流的冷却截止（纯函数，便于隔离测试）。
+///
+/// - 上游给了可解析的重置时刻 → 用它，钳制到 `[now+30s, now+7d]`
+///   （防文案异常把账号钉死一周，也防解析到过去时刻立刻失效）；
+/// - 未给 → 60s 安全退避，且**不短于**既有截止（长窗口不被短退避缩短）。
+fn next_account_model_until(prev_until: i64, now: i64, msg: Option<&str>) -> i64 {
+    let hi = now + 7 * 24 * 3600;
+    if let Some(m) = msg {
+        // ① 绝对时刻（「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」）
+        if let Some(ts) = parse_quota_reset_at(m) {
+            return ts.clamp(now + 30, hi);
+        }
+        // ② 相对秒（「N 秒后重试」/「Retry-After: Ns」）
+        if let Some(secs) = parse_relative_unfreeze_secs(m) {
+            return (now + secs).clamp(now + 30, hi);
+        }
+    }
+    // ③ 无可解析信息：60s 安全退避，且不短于既有截止
+    (now + 60).max(prev_until)
+}
+
+/// 记录一次「账号×模型」级限流：上游给了重置时刻就用它，否则 60s 安全退避。
+/// 后续失败取「本次计算值 vs 既有截止」的较大者，防止短退避覆盖长窗口。
+pub fn note_account_model_failure(state: &WbView, uid: &str, model: &str, msg: Option<&str>) {
+    let key = account_model_key(uid, model);
+    let mut map = safe_lock(&state.route_model_account_cooldowns());
+    let (prev_until, fails) = map.get(&key).copied().unwrap_or((0, 0));
+    let until = next_account_model_until(prev_until, now_ts(), msg);
+    map.insert(key, (until, fails.saturating_add(1)));
+}
+
+/// 该模型下正在冷却的账号 uid 集合（取号时排除；不影响这些账号的其他模型）
+///
+/// 顺手清理已到期条目：本表只在取号热路径读，无须额外后台清扫。
+pub fn account_model_cooling_uids(state: &WbView, model: &str) -> HashSet<String> {
+    let now = now_ts();
+    let suffix = format!("|{model}");
+    let mut map = safe_lock(&state.route_model_account_cooldowns());
+    map.retain(|_, (until, _)| *until > now);
+    map.keys()
+        .filter(|k| k.ends_with(&suffix))
+        .filter_map(|k| uid_of_key(k).map(str::to_string))
+        .collect()
+}
+
+/// 成功调用即实证该组合可用：清除对应 `uid|model` 冷却
+pub fn clear_account_model_failure(state: &WbView, uid: &str, model: &str) {
+    safe_lock(&state.route_model_account_cooldowns()).remove(&account_model_key(uid, model));
+}
+
+/// 该模型的**所有**可调度账号是否都被限流（用于在 SSE 提交前返回真实 HTTP 状态，
+/// 让 Codex++ 的 inOrder 游标能推进到下一个模型）。
+///
+/// 只要还有一个可调度账号没被限流，就返回 false —— 宁可放行后撞 429，
+/// 也不因为局部限流而提前拒绝（避免误伤）
+pub fn model_exhausted_for_all_accounts(state: &WbView, model: &str) -> bool {
+    let cooling = account_model_cooling_uids(state, model);
+    // 与真实取号同口径（skip_credit_filters=false）：遵守 50 积分保留线与
+    // 冷却/禁用规则。这样「全部可调度账号都被限流」与「取号会失败」是同一集合，
+    // 预检不会因为零积分账号的存在而误放行。
+    let selectable = state.route_pool().selectable_uids(false);
+    all_accounts_cooling(&selectable, &cooling)
+}
+
+/// 纯判定：可调度集合非空且**全部**落在该模型的冷却集合内。
+///
+/// 空集合返回 false —— 「无账号可调度」是另一类问题（由 pool 侧报 no_healthy），
+/// 不能在这里被误判成「模型额度耗尽」。
+fn all_accounts_cooling(selectable: &[String], cooling: &HashSet<String>) -> bool {
+    !selectable.is_empty() && selectable.iter().all(|u| cooling.contains(u))
+}
+
+/// 统一错误冷却落点（本轮修复的唯一入口，替代直接调用 `note_error_until`）。
+///
+/// 归因规则：
+/// - `SoftRate`（429 限流）→ 按 [`classify_rate_scope`] 分派：
+///   - `Model`（默认）→ **只**写 `uid|model`，账号继续可调度其他模型；
+///   - `Account`（文案明确指向账号/凭据/工作区）→ 账号级冷却，遵守上游解冻时刻。
+/// - 其余 kind（HardCredit/Forbidden/SessionDead/Server/Client/熔断）→ 维持既有账号级语义。
+///
+/// **不清除任何真实上游限制**：所有分支都在冷却，只是粒度不同。无解冻信息时
+/// 统一走安全退避（账号级沿用 kind 的固定时长，模型级 60s），不缩短既有截止时间。
+pub fn apply_wb_error_cooldown(
+    state: &WbView,
+    uid: &str,
+    model: &str,
+    kind: ErrKind,
+    msg: Option<&str>,
+) {
+    let scope = if kind == ErrKind::SoftRate {
+        classify_rate_scope(msg.unwrap_or(""))
+    } else {
+        RateScope::Account
+    };
+    if scope == RateScope::Model {
+        note_account_model_failure(state, uid, model, msg);
+        let until = safe_lock(&state.route_model_account_cooldowns())
+            .get(&account_model_key(uid, model))
+            .map(|(u, _)| *u)
+            .unwrap_or(0);
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "model-account cooldown: pool={} uid={} model={} kind={} scope=model until={} (账号仍可调度其他模型)",
+                state.pool_label(),
+                uid,
+                model,
+                kind.as_str(),
+                crate::api_server::pool::fmt_local_ts(until),
+            ),
+        );
+        return;
+    }
+    let unfreeze = msg.and_then(parse_account_unfreeze_at);
+    state.route_pool().note_error_until(uid, kind, unfreeze);
+}
+
+
 
 // ==================== 审核模板映射热更新（T2.1） ====================
 
@@ -857,6 +1061,45 @@ pub fn wb_stream_chat(
     ns_encoded: std::collections::HashSet<String>,
     trace: Option<WbExecTrace>,
 ) -> Response {
+    // ==================== SSE 提交前预检（本轮修复） ====================
+    //
+    // 旧行为：无论上游/池子能不能出内容，本函数都立刻返回 `200 + text/event-stream`，
+    // 真正的错误只能以流内 `event: response.failed`（code=no_healthy_account /
+    // 模型限流）下发。对 Codex++ 这类按 HTTP 状态码决定是否故障转移的网关来说，
+    // 200 意味着「成功」，inOrder 游标原地不动 → 客户端只能在同一模型上重试到断流。
+    //
+    // 修复：**在该模型已被全部可调度账号限流**时，直接返回真实 HTTP 429，
+    // 请求未产生任何 SSE 字节、无副作用，切换/重试都是安全的。判定刻意保守
+    //（见 model_exhausted_for_all_accounts）：只要还有一个账号可用就照常放行。
+    {
+        let view_pre = WbView::new(state.clone(), buddy_ai);
+        if model_exhausted_for_all_accounts(&view_pre, &model) {
+            let msg = format!(
+                "模型 {model} 在该池所有可调度账号上均已触发上游限流（account×model），\
+                 请求未下发，可直接切换到下一个模型；同账号其他模型不受影响"
+            );
+            crate::fs_utils::app_log(
+                &view_pre.data_dir,
+                &format!(
+                    "stream precheck: pool={} model={model} result=model_rate_limited_accounts_exhausted",
+                    view_pre.pool_label()
+                ),
+            );
+            return match proto {
+                Protocol::Anthropic => anthropic_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    &msg,
+                ),
+                _ => openai_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "model_rate_limited",
+                    &msg,
+                ),
+            };
+        }
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     // 批次 D-1 线程隔离：流任务迁入专用阻塞池（见 mod.rs stream_runtime 注释）
@@ -1018,6 +1261,23 @@ fn run_wb_stream(
     let mut last_bound_uid: Option<String> = None;
 
     loop {
+        // 本轮修复（429 精准冷却）：把「该账号 × 该模型」已限流的账号并入排除集。
+        // 只影响本请求对**这一个模型**的取号——这些账号在其他模型上的调度完全不受
+        // 影响（这正是旧实现缺失的维度：4000ms 的短窗口被记成整账号 4~12h 停摆）。
+        // 冷却到期由 account_model_cooling_uids 内部惰性清理后自动恢复资格。
+        {
+            let cooling_now = account_model_cooling_uids(state, model);
+            if !cooling_now.is_empty() {
+                tried.extend(cooling_now.iter().cloned());
+                // 粘性/专一命中的账号若正在该模型上冷却，弃用首轮直取，改走调度策略
+                if first_pick
+                    .as_ref()
+                    .map_or(false, |p| cooling_now.contains(&p.uid))
+                {
+                    first_pick = None;
+                }
+            }
+        }
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
         // 审查 M5：断连也是请求终局，补记一行失败用量（未取号 → "none"，与下方
         // 轮换耗尽收尾同口径），防用量页 requests 缺口
@@ -1359,8 +1619,8 @@ fn run_wb_stream(
                                 // 时刻精确冷却该账号；模型级冷却仅对网关/模型级故障
                                 // （Server/NotFound/Client）生效，防单账号限额把整池
                                 // 同名模型钉死 → pool_health 跳过 buddy 池 → 503
-                                let unfreeze = parse_account_unfreeze_at(&msg);
-                                state.route_pool().note_error_until(win_uid, kind, unfreeze);
+                                // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                apply_wb_error_cooldown(state, win_uid, model, kind, Some(&msg));
                                 if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
                                     note_model_failure_ex(state, model, Some(&msg));
                                 }
@@ -1398,6 +1658,8 @@ fn run_wb_stream(
                                 return;
                             }
                             state.route_pool().note_success(win_uid);
+                            // 成功即实证：清掉该账号该模型的限流标记（其他账号其他模型各自独立）
+                            clear_account_model_failure(state, win_uid, model);
                             // 成功：记账已由上方即时落账（终态单行）
                             clear_model_failure(state, model);
                             // 绑定粘性会话（Mutex 内 re-check 防 TOCTOU）
@@ -1520,8 +1782,8 @@ fn run_wb_stream(
                                 // 账号级/模型级冷却解耦——模型级冷却仅对网关/模型级故障生效，
                                 // 防单账号限额文案把整池同名模型钉死 → 503
                                 let upstream = upstream_msg(&resp_body);
-                                let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                apply_wb_error_cooldown(&state, &picked.uid, model, kind, upstream.as_deref());
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.route_sticky().unbind_uid(&picked.uid);
@@ -1659,6 +1921,8 @@ pub async fn wb_aggregate_chat(
         let mut last_residual_note: Option<String> = None; // 残指纹自检按请求去重（issue #122 C3）
 
         loop {
+            // 本轮修复：该模型上已限流的账号不参与取号（uid|model 粒度，其他模型不受影响）
+            tried.extend(account_model_cooling_uids(&state, &model));
             let picked = match first_pick.take() {
                 Some(p) => p,
                 None => match state.route_pool().pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false) {
@@ -1840,6 +2104,7 @@ pub async fn wb_aggregate_chat(
                                 // F-76① TTFT 入账
                                 state.record_usage_bucket_ttfb(state.usage_bucket(), &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
                                 state.route_pool().note_success(win_uid);
+                                clear_account_model_failure(&state, win_uid, &model);
                                 clear_model_failure(&state, &model);
                                 state.sticky_bind(&sticky_key, win_uid, &conv_id, now_ts());
                                 state.route_sticky().save(&state.data_dir);
@@ -1909,8 +2174,8 @@ pub async fn wb_aggregate_chat(
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
                                     // issue #159：账号级/模型级冷却解耦（口径同流式路径）
-                                    let unfreeze = parse_account_unfreeze_at(&msg);
-                                    state.route_pool().note_error_until(win_uid, kind, unfreeze);
+                                    // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                    apply_wb_error_cooldown(&state, win_uid, &model, kind, Some(&msg));
                                     if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
                                         note_model_failure_ex(&state, &model, Some(&msg));
                                     }
@@ -2022,8 +2287,8 @@ pub async fn wb_aggregate_chat(
                                     // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
                                     // 账号级/模型级冷却解耦（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                    // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                    apply_wb_error_cooldown(&state, &picked.uid, &model, kind, upstream.as_deref());
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.route_sticky().unbind_uid(&picked.uid);
@@ -2200,6 +2465,8 @@ pub async fn wb_tool_exec_chat(
         let resp_id = format!("resp_{}", now_ts());
 
         'accounts: loop {
+            // 本轮修复：该模型上已限流的账号不参与取号（uid|model 粒度，其他模型不受影响）
+            tried.extend(account_model_cooling_uids(&state, &model));
             let picked = match state
                 .route_pool()
                 .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), false)
@@ -2361,8 +2628,8 @@ pub async fn wb_tool_exec_chat(
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
                                 // issue #159：账号级/模型级冷却解耦（口径同流式路径）
-                                let unfreeze = parse_account_unfreeze_at(&msg);
-                                state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                apply_wb_error_cooldown(&state, &picked.uid, &model, kind, Some(&msg));
                                 if matches!(kind, ErrKind::Server | ErrKind::NotFound | ErrKind::Client) {
                                     note_model_failure_ex(&state, &model, Some(&msg));
                                 }
@@ -2558,8 +2825,8 @@ pub async fn wb_tool_exec_chat(
                                     // issue #159：kind=None（4001 模型配置不匹配）不冷却，对齐流内路径；
                                     // 账号级/模型级冷却解耦（口径同流式路径）
                                     let upstream = upstream_msg(&resp_body);
-                                    let unfreeze = parse_account_unfreeze_at(upstream.as_deref().unwrap_or(""));
-                                    state.route_pool().note_error_until(&picked.uid, kind, unfreeze);
+                                    // 本轮修复：429 按真实作用域冷却（默认只冷 account×model）
+                                    apply_wb_error_cooldown(&state, &picked.uid, &model, kind, upstream.as_deref());
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.route_sticky().unbind_uid(&picked.uid);
@@ -2581,6 +2848,7 @@ pub async fn wb_tool_exec_chat(
             match outcome {
                 Ok(c) => {
                     state.route_pool().note_success(&picked.uid);
+                    clear_account_model_failure(&state, &picked.uid, &model);
                     clear_model_failure(&state, &model);
                     success_uid = Some(picked.uid.clone());
                     final_completion = Some(c);
@@ -3183,5 +3451,116 @@ mod tests {
         assert!(u.get("total_tokens").is_none());
         assert_eq!(u["cache_read_token"], serde_json::json!(0));
         assert_eq!(u["cache_write_token"], serde_json::json!(0));
+    }
+
+    // ==================== 本轮修复：429 精准冷却（账号×模型） ====================
+
+    /// 429 作用域判定：默认按模型级（账号仍可调度其他模型）；
+    /// 只有上游文案明确指向账号/凭据/工作区时才升级为账号级。
+    #[test]
+    fn rate_scope_defaults_to_model_level() {
+        // WB 实测文案（不带范围限定词）→ 模型级
+        assert_eq!(
+            classify_rate_scope(
+                "您于 2026-11-07 10:11:24 UTC+8 触发限额，将在 2026-11-07 16:49:00 UTC+8 重置"
+            ),
+            RateScope::Model
+        );
+        assert_eq!(classify_rate_scope("rate limit exceeded"), RateScope::Model);
+        assert_eq!(classify_rate_scope(""), RateScope::Model);
+        assert_eq!(classify_rate_scope("Too Many Requests"), RateScope::Model);
+
+        // 明确账号级/整体性限定 → 账号级
+        for m in [
+            "your account has been rate limited",
+            "account level limit reached",
+            "restricted across all models",
+            "credential temporarily blocked",
+            "workspace quota exhausted",
+            "该账号已被限制",
+            "当前工作区触发风控",
+            "所有模型均不可用",
+        ] {
+            assert_eq!(classify_rate_scope(m), RateScope::Account, "应判账号级: {m}");
+        }
+    }
+
+    /// 冷却截止计算：优先上游重置时刻；无则 60s 安全退避；长窗口不被短退避缩短
+    #[test]
+    fn account_model_until_prefers_upstream_reset() {
+        let now = 1_800_000_000i64;
+        // 无消息 → 60s 退避
+        assert_eq!(next_account_model_until(0, now, None), now + 60);
+        // 既有截止更晚 → 保持（不得被 60s 缩短）
+        assert_eq!(next_account_model_until(now + 3600, now, None), now + 3600);
+        // 文案解析到明确重置时刻 → 采用（此处只用相对秒形态，避免依赖绝对日期）
+        let until = next_account_model_until(0, now, Some("请在 1800 秒后重试"));
+        assert_eq!(until, now + 1800);
+        // 解析不到 → 回退 60s
+        assert_eq!(next_account_model_until(0, now, Some("busy")), now + 60);
+        // 异常远期（>7d）被钳制
+        let far = next_account_model_until(0, now, Some("请在 99999999 秒后重试"));
+        assert!(far <= now + 7 * 24 * 3600, "必须钳制到 7 天内");
+    }
+
+    /// 冷却键按「账号×模型」隔离：同账号不同模型互不影响；
+    /// 同模型不同账号互不影响（这正是旧实现缺失的维度）
+    #[test]
+    fn account_model_key_isolates_account_and_model() {
+        assert_ne!(
+            account_model_key("wb-a", "hy4free"),
+            account_model_key("wb-a", "hy3"),
+            "同账号不同模型必须分属不同冷却行"
+        );
+        assert_ne!(
+            account_model_key("wb-a", "hy4free"),
+            account_model_key("wb-b", "hy4free"),
+            "同模型不同账号必须分属不同冷却行"
+        );
+        assert_eq!(uid_of_key("wb-a|hy4free"), Some("wb-a"));
+        assert_eq!(uid_of_key("wb-a|group/x"), Some("wb-a"));
+        assert_eq!(uid_of_key("nodelim"), None);
+    }
+
+    /// 场景：同账号免费模型受限但收费模型可调度 ——
+    /// 只要还有账号没被该模型限流，就**不得**判定为「模型额度耗尽」，
+    /// 必须继续放行（宁可撞 429 后换账号，也不提前拒绝造成误伤）。
+    #[test]
+    fn all_accounts_cooling_requires_full_coverage() {
+        let selectable: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut cooling = HashSet::new();
+        cooling.insert("a".to_string());
+        assert!(
+            !all_accounts_cooling(&selectable, &cooling),
+            "仅 1/3 账号受限时不得判定模型耗尽"
+        );
+
+        cooling.insert("b".to_string());
+        assert!(
+            !all_accounts_cooling(&selectable, &cooling),
+            "2/3 账号受限仍不得判定模型耗尽"
+        );
+
+        cooling.insert("c".to_string());
+        assert!(
+            all_accounts_cooling(&selectable, &cooling),
+            "全部可调度账号都被该模型限流 → 判定耗尽，SSE 提交前返回真实 429"
+        );
+    }
+
+    /// 场景：全部受限时不得无限重试；且「无账号可调度」不得被误判为模型耗尽。
+    #[test]
+    fn all_accounts_cooling_empty_selectable_is_not_exhausted() {
+        let empty: Vec<String> = Vec::new();
+        let mut cooling = HashSet::new();
+        cooling.insert("a".to_string());
+        assert!(
+            !all_accounts_cooling(&empty, &cooling),
+            "无账号可调度属 no_healthy 范畴，必须交由 pool 报错而非判模型耗尽"
+        );
+        assert!(
+            !all_accounts_cooling(&empty, &HashSet::new()),
+            "空冷却 + 空可调度 → 不得判耗尽"
+        );
     }
 }

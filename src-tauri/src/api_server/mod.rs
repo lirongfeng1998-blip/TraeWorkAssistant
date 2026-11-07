@@ -107,6 +107,19 @@ pub struct ApiSharedState {
     /// buddy-ai（国际版）模型级冷却独立实例（§4.2：Intl 池冷却表独立——同名模型
     /// 跨区不混轮，CN 侧模型故障不得冷却 Intl 池同型号，反之亦然）
     pub buddy_ai_model_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// **账号×模型**级冷却（本轮修复）：`uid|model` → (until 秒, 连续失败次数)。
+    ///
+    /// 背景（生产事故）：WB 免费模型（hy4free/hy3）的 429 是「该账号在该模型上的
+    /// 免费额度窗口耗尽」，属模型级限流；旧实现按 SoftRate 直接写账号级 `until`
+    /// 到上游解冻时刻（4~12h）→ 整个账号失去全部模型的调度资格 → 池内 4~5 个账号
+    /// 同时被锁 → `no_healthy_account` → Codex 会话整体中断。
+    ///
+    /// 本表把限流收敛到真正受限的资源：只排除「该账号 × 该模型」组合，同账号的
+    /// 其他模型（deepseek/glm 等计费模型）照常调度。账号级 `until` 仅在上游文案
+    /// 明确指向账号/凭据/工作区时使用（见 `classify_rate_scope`）。
+    pub wb_model_account_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// buddy-ai 档的账号×模型冷却独立实例（与 model_cooldowns 同口径隔离）
+    pub buddy_ai_model_account_cooldowns: Mutex<std::collections::HashMap<String, (i64, u32)>>,
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
@@ -224,6 +237,8 @@ pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState 
         pool_sticky: Mutex::new(std::collections::HashMap::new()),
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model: String::new(),
         logger: ApiLogger::new(data_dir.join("logs")),
         data_dir,
@@ -1031,6 +1046,8 @@ mod inflight_tests {
             pool_sticky: Mutex::new(std::collections::HashMap::new()),
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             buddy_ai_model_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        wb_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
+        buddy_ai_model_account_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
             total_requests: AtomicU64::new(0),

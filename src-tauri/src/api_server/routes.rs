@@ -1372,9 +1372,17 @@ pub async fn responses_api(
     // workbuddy-auto（虚拟模型）：同样在鉴权 + 白名单 + Responses→Chat 投影之后接管，
     // 不绕过准入层。放在 guard 创建之前，避免为接管路径多进出一次 inflight 计数。
     if super::wb_auto::is_auto(&model) {
+        // responses_to_chat 投影不带 stream（Responses 侧的流式开关只在顶层），
+        // 而 wb_auto::handle 依据 chat_body["stream"] 分流；不补这一位会让
+        // /v1/responses + workbuddy-auto 永远走非流式，Codex 等客户端因收不到
+        // SSE 的 response.completed 而断流。此处按顶层 stream 原样回填。
+        let mut auto_body = chat_body;
+        if stream {
+            auto_body["stream"] = Value::Bool(true);
+        }
         return super::wb_auto::handle(
             state,
-            chat_body,
+            auto_body,
             Protocol::Responses,
             key_str,
             ns_encoded,
@@ -4079,6 +4087,8 @@ mod tests {
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             buddy_ai_model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wb_model_account_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            buddy_ai_model_account_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),

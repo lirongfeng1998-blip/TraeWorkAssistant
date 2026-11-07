@@ -1325,6 +1325,8 @@ mod tests {
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             buddy_ai_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            wb_model_account_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            buddy_ai_model_account_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
